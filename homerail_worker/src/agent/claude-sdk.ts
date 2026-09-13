@@ -40,6 +40,23 @@ const AGENT_USAGE_KEYS = [
   "cache_creation_input_tokens",
 ] as const satisfies ReadonlyArray<keyof AgentUsage>;
 
+/** Non-secret provider configuration, applied on every query including correction.
+ * null/false explicitly suppress the wire effort; absent preserves SDK defaults.
+ * Unsupported selectors fail locally instead of silently reverting to high. */
+function claudeReasoningEffort(context: AgentRunContext): string | null | undefined {
+  if (context.reasoningEffortMap === false) return null;
+  const selected = context.reasoningEffort;
+  if (selected === undefined) return undefined;
+  const mapping = context.reasoningEffortMap;
+  if (mapping && !Object.prototype.hasOwnProperty.call(mapping, selected)) throw new Error(`Claude SDK reasoning effort selector is not configured: ${selected}`);
+  const effort = mapping ? mapping[selected] : selected;
+  if (effort === null) return null;
+  if (!["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    throw new Error(`Claude SDK does not support reasoning effort: ${effort}`);
+  }
+  return effort;
+}
+
 interface ClaudeSkillProjectionRuntime {
   configDir: string;
   skillCount: number;
@@ -500,6 +517,12 @@ export class ClaudeSdkAdapter implements AgentClient {
     try {
       const effectiveModel = context.model || this.model;
       const authEnv = this.buildClaudeEnv(context, effectiveModel);
+      const effectiveEffort = claudeReasoningEffort(context);
+      if (effectiveEffort !== undefined) {
+        // The SDK's environment override takes precedence over options.effort.
+        // Pin both to the scoped configuration, never to credential projections.
+        authEnv.env.CLAUDE_CODE_EFFORT_LEVEL = effectiveEffort ?? "unset";
+      }
       const requestedBuiltinTools = context.allowedBuiltinTools ?? AGENT_BUILTIN_TOOL_NAMES;
       const supportedBuiltinTools = new Set<string>(AGENT_BUILTIN_TOOL_NAMES);
       const builtinTools = context.handoffOnly
@@ -538,6 +561,7 @@ export class ClaudeSdkAdapter implements AgentClient {
       const options: Record<string, unknown> = {
         model: effectiveModel,
         maxThinkingTokens: effectiveThinkingBudget,
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         tools: builtinTools,
         allowedTools,
         permissionMode,
@@ -641,6 +665,7 @@ export class ClaudeSdkAdapter implements AgentClient {
         system_prompt_mode: systemPromptMode,
         model: effectiveModel,
         thinking_budget: effectiveThinkingBudget,
+        reasoning_effort: effectiveEffort ?? null,
         builtin_tools: builtinTools,
         dag_tool_names: tools.map((tool) => tool.name),
         session_id: context.sessionId ?? null,
@@ -663,6 +688,7 @@ export class ClaudeSdkAdapter implements AgentClient {
           max_turns: this.maxTurns,
           max_turns_source: this.maxTurnsSource,
           thinking_budget: effectiveThinkingBudget,
+          reasoning_effort: effectiveEffort ?? null,
           cwd: options.cwd,
           has_system_prompt: Boolean(context.systemPrompt),
           system_prompt_mode: systemPromptMode,

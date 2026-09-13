@@ -1277,7 +1277,7 @@ describe("/api/manager/chat", () => {
       { skill_id: "homerail-dag-patterns" },
       { managerRestUrl },
     );
-    expect(skill.result.content[0].text).toContain("Manager Agent Native Path");
+    expect(skill.result.content[0].text).toContain("../homerail-dag-ops/SKILL.md");
 
     const patterns = await _invokeHostCodexVoiceToolForTest(
       "list_dag_patterns",

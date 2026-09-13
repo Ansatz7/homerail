@@ -246,10 +246,12 @@ export async function getGitServerRepository(
 export async function getGitServerBranches(
   server_id: string,
   owner: string,
-  repo_name: string
+  repo_name: string,
+  page: number = 1,
+  per_page: number = 30
 ): Promise<GitServerBranchesResponse> {
   return http.get<{ branches: GitBranchInfo[] }>(
-    `/api/git-servers/${server_id}/branches?owner=${encodeURIComponent(owner)}&repo_name=${encodeURIComponent(repo_name)}`
+    `/api/git-servers/${server_id}/branches?owner=${encodeURIComponent(owner)}&repo_name=${encodeURIComponent(repo_name)}&page=${page}&per_page=${per_page}`
   ) as Promise<GitServerBranchesResponse>
 }
 
@@ -268,32 +270,6 @@ export async function listGitServerRepos(
   }>(
     `/api/git-servers/${server_id}/repos?page=${page}&per_page=${per_page}`
   ) as Promise<GitServerReposResponse>
-}
-
-/**
- * 更新GitServer关联的仓库配置
- */
-export async function updateGitServerRepository(
-  server_id: string,
-  owner: string,
-  repo_name: string
-): Promise<BaseResponse<{
-  owner: string
-  repo_name: string
-  clone_url: string
-}>> {
-  return http.put<{
-    owner: string
-    repo_name: string
-    clone_url: string
-  }>(`/api/git-servers/${server_id}/repository`, {
-    owner,
-    repo_name
-  }) as Promise<BaseResponse<{
-    owner: string
-    repo_name: string
-    clone_url: string
-  }>>
 }
 
 /**
@@ -464,7 +440,6 @@ export const gitCredentialsApi = {
   getGitServerRepository,
   getGitServerBranches,
   listGitServerRepos,
-  updateGitServerRepository,
   verifyTokenOnly,
 
   // 旧的Git凭证API函数（保留兼容）

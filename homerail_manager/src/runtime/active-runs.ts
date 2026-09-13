@@ -23,6 +23,8 @@ import {
   handoff,
   isFailurePort,
   isRunTerminal,
+  stalledLoopDiagnostic,
+  recordInputDelivery,
   resetNodesForRound,
   resetSkippedSuccessDescendants,
   startNode,
@@ -952,6 +954,7 @@ export function seedInitialPrompt(
       }
       const mailbox = dagRun.mailboxes.get(target.node);
       if (!mailbox) throw new Error(`DAG run input targets unknown node: ${target.node}`);
+      recordInputDelivery(dagRun, target.node, "$run", target.port, payload);
       const values = mailbox.get(target.port) ?? [];
       values.push(payload);
       mailbox.set(target.port, values);
@@ -961,6 +964,7 @@ export function seedInitialPrompt(
   for (const nodeId of getReadyNodes(dagRun)) {
     const mailbox = dagRun.mailboxes.get(nodeId);
     if (!mailbox) continue;
+    recordInputDelivery(dagRun, nodeId, "$run", "prompt", prompt);
     const values = mailbox.get("prompt") ?? [];
     values.push(prompt);
     mailbox.set("prompt", values);
@@ -1046,6 +1050,7 @@ function _rebuildDagRunFromPersisted(metadata: PersistedRunMetadata, graphData: 
   const runtimeState = metadata.dagRuntimeState;
   if (runtimeState) {
     dagRun.loopSources = new Set(runtimeState.loop_sources);
+    if (runtimeState.routed_inputs) dagRun.routedInputs = new Map(Object.entries(structuredClone(runtimeState.routed_inputs)));
     for (const node of nodes) {
       dagRun.afterSatisfied.set(node.node_id, new Set(runtimeState.after_satisfied[node.node_id] ?? []));
       dagRun.inputSatisfied.set(node.node_id, new Set(runtimeState.input_satisfied[node.node_id] ?? []));
@@ -3800,59 +3805,10 @@ export function injectActiveRun(
     delivered: false,
   };
 
-  writeRunMetadata(runId, serializeRunMetadata(run));
-  emit("dag:instruction_injected", {
-    runId,
-    nodeId,
-    instruction,
-    mode,
-  });
-
-  const target = findDispatchTarget(runId, nodeId);
-  if (target && target.targetType && target.targetId) {
-    const registryEntry =
-      target.targetType === "worker"
-        ? getWorker(target.targetId)
-        : getNode(target.targetId);
-    const socket = registryEntry?.socket;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(
-        JSON.stringify({
-          type: "inject",
-          data: { runId, nodeId, instruction, mode },
-        }),
-      );
-      result.delivered = true;
-      result.deliveryTargetType = target.targetType;
-      result.deliveryTargetId = target.targetId;
-      emit("dag:instruction_delivered", {
-        runId,
-        nodeId,
-        instruction,
-        mode,
-        targetType: target.targetType,
-        targetId: target.targetId,
-      });
-    } else {
-      result.deliveryGap = "target socket not open";
-      emit("dag:instruction_delivery_failed", {
-        runId,
-        nodeId,
-        instruction,
-        mode,
-        reason: result.deliveryGap,
-      });
-    }
-  } else {
-    result.deliveryGap = "no dispatch target found for node";
-    emit("dag:instruction_delivery_failed", {
-      runId,
-      nodeId,
-      instruction,
-      mode,
-      reason: result.deliveryGap,
-    });
-  }
+  // Legacy inject has no actor/round fence, durable receipt or Worker ACK.
+  // A successful socket send never proved model consumption (inbox was only
+  // logged). Reject without side effects; callers must use the tracked API.
+  result.deliveryGap = "DAG_LEGACY_INJECT_UNSUPPORTED: use GET /api/runs/:id/actors then POST /api/runs/:id/commands with x-homerail-dag-token, expected_round_id, expected_state_token and idempotency_key";
 
   return result;
 }
@@ -7006,6 +6962,10 @@ export function dispatchReadyNodesUntilStable(
       }
       if (!changed) break;
     }
+  }
+  if (run.status === "active") {
+    const diagnostic = stalledLoopDiagnostic(run.dagRun);
+    if (diagnostic) abortActiveRun(runId, diagnostic);
   }
   return total;
 }

@@ -7,7 +7,10 @@
  *   GET    /api/git-servers?active_only=false  -- list servers (masked tokens)
  *   POST   /api/git-servers                    -- create server
  *   DELETE /api/git-servers/{server_id}         -- delete server
+ *   PUT    /api/git-servers/{server_id}         -- update settings or token
  *   POST   /api/git-servers/{server_id}/verify  -- verify token against platform
+ *   GET    /api/git-servers/{server_id}/{user,repos,repository,branches}
+ *   POST   /api/git-servers/verify-token        -- verify without saving
  *
  * Verify for gitea: real HTTP GET to ${api_endpoint}/api/v1/user
  * with Authorization: token ${stored_token}.
@@ -19,10 +22,13 @@ import {
   getServer,
   getServerRaw,
   createServer,
+  updateServer,
   deleteServer,
   updateVerifyState,
   type CreateGitServerInput,
 } from "../persistence/git-servers.js";
+
+import { giteaApiRoot, giteaRequest, gitUser, gitRepository, gitPagination, GitServerUpstreamError } from "./gitea-client.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,36 +107,14 @@ interface VerifyResult {
   };
 }
 
-async function _verifyGitea(
-  apiEndpoint: string,
-  token: string,
-): Promise<VerifyResult> {
-  const url = `${apiEndpoint.replace(/\/$/, "")}/api/v1/user`;
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `token ${token}`,
-      Accept: "application/json",
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
+async function _verifyGitea(apiEndpoint: string, token: string): Promise<VerifyResult> {
+  return { valid: true, user_info: gitUser(await giteaRequest({ platform_type: "gitea", api_endpoint: apiEndpoint, token }, "/user")) };
+}
 
-  if (!resp.ok) {
-    return { valid: false };
-  }
-
-  const body = (await resp.json()) as Record<string, unknown>;
-  return {
-    valid: true,
-    user_info: {
-      login: String(body.login ?? ""),
-      name: String(body.full_name ?? body.name ?? ""),
-      email: String(body.email ?? ""),
-      id: typeof body.id === "number" ? body.id : 0,
-      avatar_url: String(body.avatar_url ?? ""),
-      html_url: String(body.html_url ?? ""),
-    },
-  };
+function upstreamFailure(res: http.ServerResponse, error: unknown): void {
+  const status = error instanceof GitServerUpstreamError ? error.status : 400;
+  const message = error instanceof GitServerUpstreamError ? error.message : "Invalid Git server request";
+  json(res, status, { success: false, message, error: message });
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +166,7 @@ export function gitServersRoutesHandler(
           return;
         }
 
+        giteaApiRoot(api_endpoint);
         const input: CreateGitServerInput = {
           name,
           platform_type,
@@ -211,12 +196,57 @@ export function gitServersRoutesHandler(
           );
         }
       })
-      .catch((err) => {
-        _badRequest(
-          res,
-          err instanceof Error ? err.message : "Invalid JSON body",
-        );
-      });
+      .catch(() => _badRequest(res, "Invalid Git server request body"));
+    return true;
+  }
+
+  if (pathname === "/api/git-servers/verify-token" && req.method === "POST") {
+    void _readJsonBody(req).then(async raw => {
+      const body = raw as Record<string, unknown>;
+      const platform = urlObj.searchParams.get("platform_type") ?? _requiredString(body, "platform_type");
+      const endpoint = urlObj.searchParams.get("api_endpoint") ?? _requiredString(body, "api_endpoint");
+      const token = _requiredString(body, "token");
+      if (!platform || !endpoint || !token) throw new Error("Missing verification fields");
+      const user = gitUser(await giteaRequest({ platform_type: platform, api_endpoint: endpoint, token }, "/user"));
+      _ok(res, "Token verified", { valid: true, platform, user });
+    }).catch(error => upstreamFailure(res, error));
+    return true;
+  }
+
+  const queryMatch = pathname.match(/^\/api\/git-servers\/([^/]+)\/(user|repos|repository|branches)$/);
+  if (queryMatch && req.method === "GET") {
+    const serverId = decodeURIComponent(queryMatch[1]);
+    const raw = getServerRaw(serverId);
+    if (!raw) { _notFound(res, "Git server not found"); return true; }
+    void (async () => {
+      if (!raw.is_active) throw new GitServerUpstreamError(409, "Git server is inactive");
+      const action = queryMatch[2];
+      if (action === "user") {
+        _ok(res, "Git user retrieved", { user: gitUser(await giteaRequest(raw, "/user")) }); return;
+      }
+      const pagination = gitPagination(urlObj.searchParams);
+      const query = `?page=${pagination.page}&limit=${pagination.per_page}`;
+      if (action === "repos") {
+        const repos = await giteaRequest(raw, "/user/repos" + query);
+        if (!Array.isArray(repos)) throw new GitServerUpstreamError(502, "Invalid Git server repository response");
+        _ok(res, "Repositories retrieved", { repositories: repos.map(gitRepository), ...pagination }); return;
+      }
+      const owner = urlObj.searchParams.get("owner"), repo = urlObj.searchParams.get("repo_name");
+      if (!owner || !repo || [owner, repo].some(part => part === "." || part === ".." || /[\/\\]/.test(part))) throw new Error("Invalid owner or repo_name");
+      const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+      const repository = gitRepository(await giteaRequest(raw, repoPath));
+      if (action === "repository") { _ok(res, "Repository retrieved", { repository }); return; }
+      const branches = await giteaRequest(raw, repoPath + "/branches" + query);
+      if (!Array.isArray(branches)) throw new GitServerUpstreamError(502, "Invalid Git server branch response");
+      _ok(res, "Branches retrieved", { branches: branches.map((branch: any) => ({ name: String(branch.name ?? ""), sha: String(branch.commit?.id ?? ""), is_default: branch.name === repository.default_branch })), ...pagination });
+    })().catch(error => {
+      if (error instanceof GitServerUpstreamError && [401, 403].includes(error.status)) updateVerifyState(serverId, false, new Date().toISOString(), null);
+      upstreamFailure(res, error);
+    });
+    return true;
+  }
+  if (queryMatch && req.method === "PUT") {
+    json(res, 409, { success: false, message: "Repository binding belongs to a project; update /api/projects/:id using git_server_id and git_repository", error: "GIT_REPOSITORY_BINDING_PROJECT_REQUIRED" });
     return true;
   }
 
@@ -244,6 +274,7 @@ export function gitServersRoutesHandler(
           updateVerifyState(serverId, result.valid, now, result.user_info ?? null);
           const data = {
             server_id: serverId,
+            valid: result.valid,
             token_valid: result.valid,
             last_verified: now,
             user_info: result.user_info ?? null,
@@ -257,12 +288,13 @@ export function gitServersRoutesHandler(
         .catch((err) => {
           const now = new Date().toISOString();
           updateVerifyState(serverId, false, now, null);
-          _verifyFailed(res, 502, "Verification failed", {
+          _verifyFailed(res, err instanceof GitServerUpstreamError ? err.status : 502, "Verification failed", {
             server_id: serverId,
+            valid: false,
             token_valid: false,
             last_verified: now,
             user_info: null,
-            error: err instanceof Error ? err.message : String(err),
+            error: "Git server verification failed",
           });
         });
     } else {
@@ -271,6 +303,15 @@ export function gitServersRoutesHandler(
         `Verify not supported for platform_type: ${raw.platform_type}. Only gitea is supported.`,
       );
     }
+    return true;
+  }
+
+  if (!subAction && req.method === "PUT") {
+    void _readJsonBody(req).then(raw => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Expected object");
+      const server = updateServer(serverId, raw as Record<string, unknown>);
+      if (!server) _notFound(res, "Git server not found"); else _ok(res, "Git server updated", server);
+    }).catch(error => upstreamFailure(res, error));
     return true;
   }
 

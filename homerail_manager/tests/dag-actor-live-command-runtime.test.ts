@@ -27,6 +27,7 @@ import {
   dispatchReadyNodes,
   dispatchRecoveredRuns,
   getActiveRun,
+  injectActiveRun,
   handoffActiveRun,
   recoverAllActiveRuns,
 } from "../src/runtime/active-runs.js";
@@ -158,6 +159,16 @@ describe("DAG Actor live-command runtime", () => {
     if (previousHome === undefined) delete process.env.HOMERAIL_HOME;
     else process.env.HOMERAIL_HOME = previousHome;
     fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it.each(["inbox", "auto", "interrupt", "redispatch"])("rejects unfenced legacy %s without writing to a Worker", (mode) => {
+    createActiveRun("legacy", workflow());
+    dispatchReadyNodes("legacy", new CapturingDispatcher());
+    const send = vi.fn();
+    bindFakeWorker("legacy", ["actor_one"], [DAG_ACTOR_LIVE_COMMAND_CAPABILITY, DAG_TRANSPORT_FENCE_CAPABILITY], send);
+    expect(injectActiveRun("legacy", "actor_one", "feedback", mode)).toMatchObject({ delivered: false, deliveryGap: expect.stringContaining("DAG_LEGACY_INJECT_UNSUPPORTED") });
+    expect(send).not.toHaveBeenCalled();
+    expect(listDagActorLiveCommands({ run_id: "legacy" })).toEqual([]);
   });
 
   it("keeps socket write queued and advances Worker status through the full persisted fence", async () => {

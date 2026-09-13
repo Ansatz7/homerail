@@ -586,7 +586,7 @@ export class ChangeOrchestrator {
       throw new Error(`Injection failed for run ${runId} node ${nodeId}`);
     }
     return {
-      injected: true,
+      injected: result.delivered,
       nodeId,
       mode,
       delivered: result.delivered,

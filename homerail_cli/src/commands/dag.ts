@@ -426,11 +426,11 @@ export function registerDagCommands(program: Command): void {
   program
     .command("inject <runId> <nodeId> <instruction>")
     .description("Inject an instruction into a DAG node")
-    .option("--mode <mode>", "Injection mode: auto|inbox|interrupt|redispatch", "inbox")
+    .option("--mode <mode>", "Legacy mode (unsupported); use the tracked run commands API", "inbox")
     .action(async (runId: string, nodeId: string, instruction: string, opts: { mode: string }) => {
       const globalOpts = program.opts<GlobalOpts>();
       const client = getClient(globalOpts);
-      process.exitCode = await cmdInject(client, runId, nodeId, instruction, opts.mode);
+      process.exitCode = await cmdInject(client, runId, nodeId, instruction, opts.mode, !!globalOpts.json);
     });
 
   registerResumeCommand(program);
