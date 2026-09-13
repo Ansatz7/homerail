@@ -100,7 +100,7 @@ Direct invocation examples:
 - Codex: `$homerail-install-ops`
 - Claude Code: `/homerail-install-ops`
 - DAG design, execution and supervision in Codex: `$homerail-dag-ops`
-- DAG design, execution and inspection in Claude Code: `/homerail-dag-ops`
+- DAG design, execution and supervision in Claude Code: `/homerail-dag-ops`
 
 For DAG work, install only `homerail-dag-ops`; its references and scripts contain
 pattern design, event listening, decisions, and verification. The old
@@ -116,3 +116,11 @@ consume their callbacks through `homerail-dag-ops` without recreating DAG runs.
 A link in `~/.codex/skills` is available across this user's project directories.
 The source checkout must remain available. Other operating-system users or
 isolated Codex homes need their own link.
+
+The DAG skill is model- and harness-independent. Its default helper uses
+`register` / `wait` / `ack` with JSON event output; no agent executable or harness
+thread ID is required. Install it into any agent's supported skill directory.
+Optional host adapters consume event JSON on stdin and own that host's delivery
+semantics. Session suspension, steering and wakeup remain host capabilities.
+The bundled Python helper runs on Linux; other environments may use the same
+existing HomeRail HTTP/SSE interfaces through their available tools.

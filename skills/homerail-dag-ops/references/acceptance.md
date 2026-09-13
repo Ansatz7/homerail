@@ -1,117 +1,86 @@
-# DAG event subscriptions: acceptance contract
+# DAG skill acceptance
 
-Branch: `codex/dag-event-subscriptions`. Baseline: `ae61a9721388d3d23b9af6931b38e4580555000b`.
+Branch: `codex/dag-event-subscriptions`. Runtime code baseline:
+`ae61a9721388d3d23b9af6931b38e4580555000b`. Changes stay in skill directories;
+do not merge or deploy HomeRail as part of skill validation.
 
-## Outcome
+## Current contract: model and harness independent
 
-A caller registers observation of an existing DAG once and ends its model turn.
-A persistent, ordinary host process listens to Manager events, without running a
-model or repeatedly returning progress into a model conversation. Only completion,
-external decisions, or sustained observation problems trigger a notification.
-The observer never creates, retries, resumes, cancels, or approves a DAG.
-
-## Required acceptance gates
-
-1. The skill’s `dag_subscription.py install` returns a durable subscription/service identity promptly;
-   it does not remain the watcher. Status, events, acknowledgment and unsubscribe
-   are available through the bundled script. Repeating the same registration is idempotent;
-   incompatible changes to an existing subscription fail.
-2. Only existing Manager run metadata, approvals, and SSE APIs are used. The
-   observer projects a small versioned local snapshot and binds run creation /
-   workflow identity. SSE is a hint; reconnects reconcile current state. No
-   Manager endpoint, heartbeat, durable cursor, or HomeRail CLI command is added.
-3. Ordinary progress, chat/token deltas and handled node failures cause zero
-   notifications. Terminal outcomes, pending external commands/approvals, quiet
-   deadlines and sustained unavailability have distinct typed events. An
-   observation failure never claims the DAG failed. Waiting/approval consumption
-   does not end observation of later completion.
-4. Events are persisted before delivery; stable event identity, private receipts,
-   bounded notification text and explicit consumer acknowledgment are retained.
-   Repeated acknowledgment is harmless. Pending delivery survives a crash;
-   attempted-but-unknown delivery is not blindly repeated. An explicit redelivery
-   uses the same event ID and documents the possibility of duplicate transport.
-5. A persistent user service and frozen observer runtime survive controller exit,
-   disconnect and process restart. Boot ID and process start identity prevent PID
-   reuse mistakes. Completed/cancelled subscriptions do not restart observation.
-   Cancelling observation leaves the DAG running and retains all event evidence.
-6. Protocol validation, identity replacement, malformed/oversized responses,
-   credential references, notification failure and concurrent operations are
-   tested. No credentials or raw model text enter events, notifications or logs.
-7. Skill-local deterministic fault tests, script CLI tests, existing Manager SSE
-   integration, and skill structure validation pass on the final tree. An isolated real Manager/systemd lifecycle proof and
-   a real notification to the current task are retained outside the repository;
-   no production restart or host reboot is used as a test.
-8. Documentation states Linux/user-systemd requirements, how to end the model
-   turn, acknowledgment semantics, retry limits, recovery commands and mechanism
-   boundaries. Keep changes inside skill directories and their installation guidance, install it by symlink for Codex, and
-   commit a reviewable result; do not merge or deploy HomeRail.
-
-## Boundaries
-
-The subscription observes durable current state, not an exactly-once journal of
-every transient event. Completed decisions that need no further action are not
-replayed as new requests. Delivery acceptance is not consumer acknowledgment.
-No transport without an idempotency contract can promise exactly-once wakeup.
-Snapshot hashes bind observed identity/integrity, not test truth or PR acceptance.
-No claim of whole-host reboot validation is made from a simulated boot or a
-service restart. Existing Auto Fix command supervisors retain their semantics.
+1. One skill covers design, execution, event waiting, decisions and evidence.
+   It guides the current agent and never requires a second agent/model executor.
+2. Version-2 registration requires only Manager/run/consumer identity and
+   observation policy. The consumer ID is caller-owned and not tied to a
+   harness session API. Repeating a registration is idempotent; incompatible
+   specs or lifecycle modes are rejected.
+3. `register` creates durable identity/state without starting an observer,
+   systemd service or notifier. `wait` blocks in ordinary code, stays silent
+   through routine progress, returns one actionable JSON event and exits.
+   Reading the same unacknowledged event again is safe. It is not auto-ACKed.
+4. Default waiting needs no model CLI, notification executable, systemd or
+   platform-specific model configuration. Linux/Python requirements belong to
+   the bundled helper, not to a particular agent harness. Other hosts can use
+   the existing HTTP/SSE interfaces with their available tools.
+5. An optional adapter receives exactly its configured argv and one JSON event
+   on stdin. The helper adds no thread/message/queue/steer/model flags. Transport
+   acceptance and consumption ACK remain distinct. Ambiguous deliveries never
+   automatically resend; explicit redelivery preserves the stable event ID.
+6. State is persisted before output/delivery. Lost tool results replay the same
+   unacknowledged event. Reissued waits recover observation without resubmitting
+   the DAG. Concurrent waiters reuse an existing observer; they may receive the
+   same event, so consumers must deduplicate/ACK before repeating side effects.
+7. Optional persistent user-systemd observation survives process failure using
+   a frozen runtime and boot/process identity. Stopping observation leaves the
+   DAG untouched and preserves receipts. A host callback or event continuation
+   must be verified separately before claiming an agent can be woken.
+8. Existing run metadata, approvals and SSE APIs are the only Manager inputs.
+   Ordinary progress remains quiet; terminal/approval/command/quiet/outage events
+   are distinct. Replayed raw SSE text is not persisted as model instructions.
+   Observation failure never implies DAG success or failure.
+9. The skill states that a model prompt cannot force suspension, steering or
+   wakeup. A host without event/tool continuation cannot gain it by loading a
+   skill. No exactly-once transport or lossless transient-event claim is made.
+10. Legacy version-1 receipts remain readable/acknowledgeable using their frozen
+    helpers. The new helper rejects registration/execution under the old command
+    contract; migration must not silently duplicate an active observer or DAG.
 
 ## Reproduce
-
-Run from the repository root:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s skills/homerail-dag-ops/scripts -p 'test_*.py' -v
 ```
 
-For the opt-in integration check, build the existing protocol, plugin SDK, and
-Manager packages first with their respective `npm --prefix <package> run build`.
-Then run:
+For the optional integration fixture, first build the existing protocol, plugin
+SDK and Manager packages with their respective `npm --prefix <package> run build`.
+The fixture uses unchanged Manager HTTP handlers and GraphExecutor with a real
+deterministic command, never production Manager/Workers or model calls.
 
 ```bash
+# Default transport: blocking JSON tool result, no notification CLI or systemd
 PYTHONDONTWRITEBYTECODE=1 python3 skills/homerail-dag-ops/scripts/check_integration.py \
-  --evidence /absolute/fresh/private/evidence-directory
+  --evidence /absolute/fresh/private/blocking-proof
+
+# Optional systemd and generic stdin adapter, using a separate fresh directory
+PYTHONDONTWRITEBYTECODE=1 python3 skills/homerail-dag-ops/scripts/check_integration.py \
+  --service --evidence /absolute/fresh/private/service-proof
 ```
 
-The fixture uses unchanged Manager HTTP handlers and GraphExecutor with a real
-deterministic command; it does not launch production Manager, Workers, or models.
-It kills/restarts only its observer, asserts a single command execution and one
-terminal event, then stops/disables its test service. To test actual queue
-acceptance, add `--thread <current-task-id> --codex <absolute-codex-path>`; this
-sends one real notification. Queue acceptance is not proof of an idle task being
-woken. Verify that separately after ending the model turn, and retain that
-distinction in the evidence. Failed fixture attempts keep logs for diagnosis.
+The default test registers in one process, interrupts/reissues the blocking wait,
+asserts zero progress output and one command execution/event, then ACKs it. The
+service test kills/restarts only its observer and records the standard JSON with
+an ordinary stdin adapter. Both preserve evidence and stop their test observers.
+Neither claims whole-host reboot or automatic host-session wakeup validation.
 
-Initial validation on 2026-09-13: 15 fault/HTTP/script tests passed; skill
-structure validator passed; real Manager handler/GraphExecutor integration and
-systemd SIGKILL recovery passed. The test DAG command executed once, ordinary
-progress produced zero notifications, and completion produced one accepted
-Codex queue delivery. The current task inspected and acknowledged the persisted
-event. The callback subsequently arrived in the same active Codex task and its
-already-acknowledged event was deduplicated. Idle-task wakeup and a whole-host
-reboot were not validated in that run.
+## Validation history and evidence scope
 
-Root `npm run ci` also passed on rerun. The first run and one focused recheck
-failed the existing `durable-command-workflow.test.ts` finished-unconsumed
-SIGKILL recovery case; the same test passed in a detached baseline checkout,
-and the subsequent full CI passed without source changes. Retain both logs;
-this does not establish a diagnosis or fix for that intermittent failure.
-
-## Unified DAG skill acceptance
-
-The unified `homerail-dag-ops` entry covers design, execution, background waiting,
-decision handling and output verification. Its references are loaded by task
-stage. The separate supervision entry is removed; the existing patterns ID is
-a short compatibility link to the canonical pattern reference. New Codex DAG
-installs expose only `homerail-dag-ops`. Frozen observer receipts remain valid.
-
-After consolidation on 2026-09-13, all 15 observer tests, 59 focused Manager
-skill/schema/bootstrap tests and 5 existing showcase-contract tests passed.
-All local Markdown references resolved and four affected skill entrypoints
-passed structure validation. The relocated integration fixture passed real
-Manager handler/GraphExecutor execution, observer SIGKILL recovery, one command
-execution, one terminal event and ACK with a deterministic notification sink.
-No new real Codex callback or idle-task wake test was performed in this pass.
-The earlier full-CI and actual-Codex results above predate this consolidation;
-the focused checks validate the changed skill loading and script paths.
+- Initial version-1 implementation: 15 tests, real Manager/systemd integration,
+  and one real Codex queue callback/ACK passed. Idle-session wakeup was not
+  tested. Full repository CI passed on rerun, after an intermittent existing
+  finished-unconsumed recovery test failure; that failure was not claimed fixed.
+- Skill consolidation: 15 helper tests, 59 Manager skill/schema/bootstrap tests,
+  5 showcase-contract tests, reference checks and a relocated systemd fixture
+  passed. These results precede the generic version-2 transport change.
+- Generic version-2 transport: 20 helper tests and both fixture modes above
+  passed on 2026-09-13, with zero model/harness calls in either fixture. Earlier
+  Codex/full-CI results are historical and do not establish
+  current adapter or host wakeup behavior. Store per-run proof outside the repo.

@@ -31,8 +31,8 @@ class SubscriptionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / 'store'
         self.unit_dir = Path(self.temp.name) / 'units'
-        self.spec = {'version': 1, 'manager_url': 'http://127.0.0.1:9999', 'run_id': 'run-test',
-                     'thread': 'task-test', 'notify_argv': ['/bin/true'], 'quiet_seconds': 20,
+        self.spec = {'version': 2, 'manager_url': 'http://127.0.0.1:9999', 'run_id': 'run-test',
+                     'consumer_id': 'task-test', 'notify_argv': ['/bin/true'], 'quiet_seconds': 20,
                      'unavailable_seconds': 5, 'timeout_seconds': 100}
         with patch.object(d, 'fetch_snapshot', return_value=observation()):
             self.receipt = d.install(self.home, self.spec, unit_dir=self.unit_dir, manage_service=False)
@@ -166,6 +166,72 @@ class SubscriptionTests(unittest.TestCase):
         for value in ([], {}, {'runId': 'run-test', 'createdAt': float('nan'), 'nodeStates': {}}):
             with self.subTest(value=value), patch.object(d, 'get_json', return_value=value):
                 with self.assertRaises(ValueError): d.fetch_snapshot(self.spec)
+
+    def test_registration_and_wait_need_no_adapter_or_service(self):
+        spec = dict(self.spec, consumer_id='generic-consumer')
+        del spec['notify_argv']
+        with patch.object(d, 'fetch_snapshot', return_value=observation()), \
+             patch.object(d, 'systemctl', side_effect=AssertionError('no service manager needed')), \
+             patch.object(d.subprocess, 'run', side_effect=AssertionError('no subprocess needed')), \
+             patch.object(d.subprocess, 'check_output', side_effect=AssertionError('no platform probe needed')):
+            registration = d.install(self.home, spec, unit_dir=self.unit_dir, manage_service=False)
+            root = Path(registration['directory']); record = d.load_record(root)
+            self.assertIsNone(registration['service'])
+            self.assertFalse(self.unit_dir.exists())
+            d.reconcile_snapshot(root, record, observation('completed'))
+            payload = d.wait_for_event(root)
+            self.assertEqual(payload['consumer_id'], 'generic-consumer')
+            self.assertEqual(payload['event']['kind'], 'terminal')
+            # A lost tool result can be read again until explicit acknowledgment.
+            self.assertEqual(payload, d.wait_for_event(root))
+            d.acknowledge(root, payload['event']['event_id'], payload['event_digest'])
+            self.assertIsNone(d.wait_for_event(root)['event'])
+
+    def test_wait_blocks_through_ordinary_progress(self):
+        ready = threading.Event(); release = threading.Event()
+        def events(spec):
+            ready.set()
+            self.assertTrue(release.wait(3))
+            yield 'dag:run_completed'
+        with patch.object(d, 'fetch_snapshot', side_effect=[observation(), observation('completed')]), \
+             patch.object(d, 'stream', side_effect=events), \
+             patch.object(d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(d.wait_for_event, self.root)
+                try:
+                    self.assertTrue(ready.wait(3))
+                    self.assertFalse(result.done())
+                    self.assertFalse(self.state()['events'])
+                finally: release.set()
+                self.assertEqual(result.result(timeout=3)['event']['kind'], 'terminal')
+
+    def test_wait_reuses_an_existing_observer(self):
+        with d.lock(self.root / 'observer.lock', nonblocking=True):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(d.wait_for_event, self.root)
+                self.assertFalse(result.done())
+                event_id = self.terminal()
+                self.assertEqual(result.result(timeout=3)['event']['event_id'], event_id)
+
+    def test_generic_adapter_receives_json_stdin_and_exact_argv(self):
+        destination = Path(self.temp.name) / 'received.json'
+        code = 'import sys,json;from pathlib import Path;Path(sys.argv[1]).write_text(json.dumps(json.load(sys.stdin)))'
+        spec = dict(self.spec, consumer_id='custom-host', notify_argv=[sys.executable, '-c', code, str(destination)])
+        with patch.object(d, 'fetch_snapshot', return_value=observation()):
+            registration = d.install(self.home, spec, manage_service=False)
+        root = Path(registration['directory']); record = d.load_record(root)
+        d.reconcile_snapshot(root, record, observation('completed'))
+        d.flush(root, record)
+        payload = d.read(destination)
+        self.assertEqual(payload['consumer_id'], 'custom-host')
+        self.assertEqual(d.sha(payload['event']), payload['event_digest'])
+        ack = json.loads(subprocess.check_output(payload['ack_argv']))
+        self.assertEqual(ack['consumer'], 'custom-host')
+
+    def test_legacy_spec_is_not_silently_reinterpreted(self):
+        spec = dict(self.spec, version=1, thread='old-task')
+        del spec['consumer_id']
+        with self.assertRaises(ValueError): d.validate_spec(spec)
 
 
 class HttpTests(unittest.TestCase):

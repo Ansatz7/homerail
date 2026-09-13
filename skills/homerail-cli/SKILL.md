@@ -228,8 +228,8 @@ waits for the deterministic two-node DAG to reach `completed`.
 
 ### DAG Supervision and Inspection
 
-For asynchronous Codex work, follow `homerail-dag-ops`: register its background
-listener and end the model turn. The commands below are syntax references for
+For asynchronous work, follow `homerail-dag-ops`: subscribe and await an event
+through the current host; the bundled helper supports blocking JSON output. The commands below are syntax references for
 foreground inspection, not a sequence to repeat during unchanged progress.
 
 ```bash

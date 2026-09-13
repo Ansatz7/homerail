@@ -200,7 +200,7 @@ hr --json dag validate /tmp/release-decision.yaml
 hr dag sync /tmp/release-decision.yaml
 hr profile sync <profile.yaml> --workflow release-decision
 hr run --workflow release-decision --profile <profile-id> --prompt "<task>"
-# For asynchronous Codex work, register the listener from supervision.md, then end the turn.
+# For asynchronous work, use the host waiting path described in supervision.md.
 hr dag handoffs <run-id> --content-limit 0
 
 # Durable governance and state operations

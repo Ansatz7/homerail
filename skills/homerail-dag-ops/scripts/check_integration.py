@@ -1,8 +1,8 @@
-"""Opt-in Linux integration proof; no production endpoints or model execution.
+"""Opt-in Linux proof with real Manager routes/executor, no model or harness.
 
-python3 check_integration.py --evidence /absolute/private/directory
-Optionally --thread CURRENT_TASK --codex /absolute/path/to/codex sends ONE real
-notification to that task. Receipt ACK must then be performed by the consumer.
+Default: register + blocking JSON wait, no service manager or notification CLI.
+Add --service to test optional user-systemd recovery and a generic stdin adapter.
+Use --evidence /absolute/fresh/private/directory to retain all receipts.
 """
 import argparse
 import json
@@ -22,81 +22,96 @@ def eventually(check, timeout=35):
     while time.monotonic() < deadline:
         value = check()
         if value: return value
-        time.sleep(.2)  # Fixture driver only; no model invocations.
+        time.sleep(.2)  # Ordinary fixture driver; no model invocations.
     raise AssertionError('integration condition timed out')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evidence', required=True)
-    parser.add_argument('--thread')
-    parser.add_argument('--codex')
+    parser.add_argument('--service', action='store_true')
     args = parser.parse_args()
-    if bool(args.thread) != bool(args.codex): parser.error('--thread and --codex must be paired')
     root = d.private(Path(args.evidence))
     fixture = d.private(root / 'manager')
     if (fixture / 'ready.json').exists(): raise ValueError('use a fresh evidence directory')
     log = (root / 'manager.log').open('w')
-    # No production credentials or HomeRail environment are passed to the fixture.
     env = {key: os.environ[key] for key in ('HOME', 'PATH', 'LANG') if key in os.environ}
     manager = subprocess.Popen([shutil.which('node'), str(d.HERE / 'manager_fixture.mjs'), str(fixture)],
                                env=env, stdout=log, stderr=log, start_new_session=True)
-    registration = None
+    registration, waiter = None, None
     try:
         def manager_ready():
             if manager.poll() is not None: raise AssertionError('fixture exited; inspect manager.log')
             return d.read(fixture / 'ready.json') if (fixture / 'ready.json').exists() else None
         ready = eventually(manager_ready)
-        spec = {'version': 1, 'manager_url': ready['manager_url'], 'run_id': ready['run_id'],
-                'thread': args.thread or 'integration-test',
-                'notify_argv': [args.codex, 'queue'] if args.codex else ['/bin/true'],
-                'quiet_seconds': 60, 'timeout_seconds': 110, 'request_seconds': 2,
-                'environment': {'PATH': os.environ['PATH']}}
+        spec = {'version': 2, 'manager_url': ready['manager_url'], 'run_id': ready['run_id'],
+                'consumer_id': 'integration-consumer', 'quiet_seconds': 60,
+                'timeout_seconds': 110, 'request_seconds': 2}
+        if args.service:
+            code = 'import json,sys;from pathlib import Path;Path(sys.argv[1]).write_text(json.dumps(json.load(sys.stdin)))'
+            spec['notify_argv'] = [sys.executable, '-c', code, str(root / 'adapter-event.json')]
         store = root / 'observer'
         cli = [sys.executable, str(d.HERE / 'dag_subscription.py'), '--home', str(store)]
-        # This registering process exits; systemd owns the continuing observer.
-        registration = json.loads(subprocess.check_output(cli + ['install'], input=json.dumps(spec).encode()))
+        registration = json.loads(subprocess.check_output(cli + ['install' if args.service else 'register'],
+                                                         input=json.dumps(spec).encode()))
         job = Path(registration['directory']); record = d.load_record(job)
+        def start_waiter():
+            return subprocess.Popen(cli + ['wait', record['id']], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not args.service:
+            assert registration['service'] is None
+            assert not d.load_state(job, record).get('observer'), 'registration must not launch an observer'
+            waiter = start_waiter()
         def observer():
             value = d.load_state(job, record).get('observer', {})
             return value if value.get('process_identity') == d.process_identity(value.get('pid')) and value.get('pid') else None
         first = eventually(observer)
         eventually(lambda: d.load_state(job, record)['last_snapshot'])
-        assert not d.load_state(job, record)['events'], 'ordinary running state must stay quiet'
+        assert not d.load_state(job, record)['events'], 'ordinary progress must stay quiet'
         os.kill(first['pid'], signal.SIGKILL)
+        if not args.service:
+            assert waiter.communicate(timeout=5)[0] == b'', 'ordinary progress must not print output'
+            waiter = start_waiter()  # Host can reissue a lost tool call with the same subscription.
         second = eventually(lambda: value if (value := observer()) and value != first else None)
-        assert d.systemctl('is-enabled', record['service']) == 'enabled'
+        if args.service: assert d.systemctl('is-enabled', record['service']) == 'enabled'
         workspace = fixture / 'workspace' / ready['run_id']
         eventually(lambda: (workspace / 'count').exists())
         (workspace / 'release').touch()
-        def delivered():
-            entries = d.load_state(job, record)['events']
-            return entries if entries and all(e['delivery'] not in ('pending', 'attempting') for e in entries.values()) else None
-        entries = eventually(delivered)
+        if args.service:
+            def delivered():
+                entries = d.load_state(job, record)['events']
+                return entries if entries and all(e['delivery'] == 'accepted' for e in entries.values()) else None
+            eventually(delivered)
+            payload = d.read(root / 'adapter-event.json')
+        else:
+            output, error = waiter.communicate(timeout=35)
+            assert waiter.returncode == 0, error
+            assert len(output.splitlines()) == 1, output
+            payload = json.loads(output)
+            d.save(root / 'tool-event.json', payload)
+        entries = d.load_state(job, record)['events']
         assert len(entries) == 1, entries
         entry = next(iter(entries.values()))
+        assert payload['event'] == entry['event'] and payload['event_digest'] == entry['event_digest']
         assert entry['event']['kind'] == 'terminal' and entry['event']['details']['status'] == 'completed'
-        assert entry['delivery'] == 'accepted', entry['delivery']
         assert (workspace / 'count').read_text() == 'x', 'DAG command must execute once'
         assert d.fetch_snapshot(spec)['status'] == 'completed'
-        proof = {'passed': True, 'real_manager_routes_and_executor': True, 'model_calls_by_fixture': 0,
-                 'controller_exited': True, 'service_restarted_after_sigkill': True,
+        ack = json.loads(subprocess.check_output(payload['ack_argv']))
+        assert ack['consumer'] == spec['consumer_id']
+        proof = {'passed': True, 'real_manager_routes_and_executor': True, 'model_or_harness_calls': 0,
+                 'mode': 'systemd-generic-adapter' if args.service else 'blocking-json-tool',
+                 'service_restarted_after_sigkill': args.service, 'tool_reissued_after_sigkill': not args.service,
                  'observer_before': first, 'observer_after': second, 'ordinary_progress_notifications': 0,
-                 'terminal_notifications': 1, 'dag_command_executions': 1,
-                 'real_codex_transport': bool(args.codex), 'consumer_ack_verified': False,
+                 'terminal_events': 1, 'dag_command_executions': 1, 'consumer_ack_verified': True,
                  'host_reboot_tested': False, 'registration': registration,
                  'event_id': entry['event']['event_id'], 'event_digest': entry['event_digest']}
-        if not args.codex:
-            d.acknowledge(job, proof['event_id'], proof['event_digest'])
-            proof['consumer_ack_verified'] = True
         d.save(root / 'proof.json', proof)
         print(json.dumps(proof))
     finally:
-        # Release any detached deterministic command even after a failed check.
         workspace = fixture / 'workspace' / 'skill-listener-proof'
         if workspace.is_dir(): (workspace / 'release').touch()
-        if registration:
-            d.unsubscribe(Path(registration['directory']))
+        if registration: d.unsubscribe(Path(registration['directory']))
+        if waiter and waiter.poll() is None:
+            waiter.terminate(); waiter.communicate(timeout=5)
         try: os.killpg(manager.pid, signal.SIGTERM)
         except ProcessLookupError: pass
         try: manager.wait(timeout=5)

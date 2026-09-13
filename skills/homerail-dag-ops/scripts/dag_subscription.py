@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only DAG subscriptions. No model calls, DAG mutations, or shell commands.
 
-SSE reconciles current state, not a lossless event journal. Queue acceptance and
+SSE reconciles current state, not a lossless event journal. Transport acceptance and
 consumer acknowledgment are separate. Unknown external deliveries never retry
 automatically. Installed runtimes and receipts live outside candidate checkouts.
 """
@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import shlex
 import stat
 import subprocess
 import sys
@@ -71,17 +70,18 @@ def clean_url(value):
 
 
 def validate_spec(spec):
-    allowed = {'version', 'manager_url', 'run_id', 'thread', 'notify_argv', 'admin_token_file',
+    allowed = {'version', 'manager_url', 'run_id', 'consumer_id', 'notify_argv', 'admin_token_file',
                'timeout_seconds', 'quiet_seconds', 'unavailable_seconds', 'request_seconds', 'environment'}
-    if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
+    if (not isinstance(spec, dict) or set(spec) - allowed or
+            type(spec.get('version')) is not int or spec['version'] != 2):
         raise ValueError('invalid subscription spec')
     spec = dict(spec)
     spec['manager_url'] = clean_url(spec['manager_url'])
-    for name in ('run_id', 'thread'):
+    for name in ('run_id', 'consumer_id'):
         if not isinstance(spec.get(name), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', spec[name]):
             raise ValueError('invalid ' + name)
     command = spec.get('notify_argv')
-    if (not isinstance(command, list) or not command or len(command) > 32 or
+    if command is not None and (not isinstance(command, list) or not command or len(command) > 32 or
             any(not isinstance(x, str) or not x or any(c in x for c in '\x00\n\r') for x in command)
             or not Path(command[0]).is_absolute()):
         raise ValueError('notify_argv requires an absolute executable and argument array')
@@ -96,10 +96,10 @@ def validate_spec(spec):
     if token_file is not None and (not isinstance(token_file, str) or not Path(token_file).is_absolute()):
         raise ValueError('admin_token_file must be an absolute private credential reference')
     env = spec.setdefault('environment', {})
-    # Only search paths and Codex's configuration location may be persisted.
-    if (not isinstance(env, dict) or set(env) - {'PATH', 'CODEX_HOME'} or
+    # Host-specific configuration belongs in an optional adapter, not the core.
+    if (not isinstance(env, dict) or set(env) - {'PATH'} or
             any(not isinstance(v, str) or '\x00' in v or '\n' in v for v in env.values())):
-        raise ValueError('only PATH and CODEX_HOME environment references are supported')
+        raise ValueError('only PATH environment overrides are supported')
     return spec
 
 
@@ -270,20 +270,22 @@ def install(home, spec, *, unit_dir=None, manage_service=True):
         if linger != 'yes': raise ValueError('user lingering must already be enabled')
         systemctl('show-environment')
     jobs = private(home / 'subscriptions')
-    key = sha([spec['manager_url'], spec['run_id'], spec['thread']])
+    key = sha([spec['manager_url'], spec['run_id'], spec['consumer_id']])
     root = jobs / key
     with lock(home / 'registry.lock'):
         if root.exists():
             record = load_record(root)
             if record['spec'] != spec:
                 raise ValueError('subscription already exists with another immutable spec')
+            if bool(record['service']) != manage_service:
+                raise ValueError('subscription already exists with another observer mode')
         else:
             initial = fetch_snapshot(spec)  # Missing/old Manager: no partial registration or unit.
             stage = Path(tempfile.mkdtemp(prefix='.subscribe-', dir=jobs))
             try:
                 record = {'id': key, 'spec': spec, 'spec_digest': sha(spec), 'identity': initial['identity'],
                           'runtime': runtime(home), 'python': str(Path(sys.executable).resolve()),
-                          'service': 'homerail-dag-subscription-' + key + '.service',
+                          'service': 'homerail-dag-subscription-' + key + '.service' if manage_service else None,
                           'unit_dir': str(unit_dir or Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'systemd/user')}
                 save(stage / 'registration.json', record)
                 now = time.time()
@@ -295,17 +297,20 @@ def install(home, spec, *, unit_dir=None, manage_service=True):
                 if stage.exists(): shutil.rmtree(stage)
         # Preserve a stopped subscription and its evidence on repeated registration.
         state = load_state(root, record)
-        unit = Path(record['unit_dir']) / record['service']
-        unit.parent.mkdir(parents=True, exist_ok=True)
-        content = unit_text(root, record)
-        if unit.exists() and unit.read_text() != content:
-            raise ValueError('refusing to replace an unowned service')
-        if not unit.exists():
-            save_text(unit, content)
+        if manage_service:
+            unit = Path(record['unit_dir']) / record['service']
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            content = unit_text(root, record)
+            if unit.exists() and unit.read_text() != content:
+                raise ValueError('refusing to replace an unowned service')
+            if not unit.exists():
+                save_text(unit, content)
         if manage_service and state['status'] == 'watching':
             systemctl('daemon-reload'); systemctl('enable', '--now', record['service'])
     return {'subscription_id': key, 'directory': str(root), 'service': record['service'],
-            'status': state['status'], 'registered': True, 'model_may_end_turn': True}
+            'status': state['status'], 'registered': True,
+            'observer_mode': 'service' if manage_service else 'foreground',
+            'delivery_mode': 'adapter' if spec.get('notify_argv') else 'event_output'}
 
 
 def append_event(state, record, kind, occurrence, details):
@@ -314,7 +319,8 @@ def append_event(state, record, kind, occurrence, details):
         event = {'event_id': event_id, 'subscription_id': record['id'], 'kind': kind,
                  'run_id': record['spec']['run_id'], 'identity': record['identity'], 'details': details}
         state['events'][event_id] = {'event': event, 'event_digest': sha(event), 'created_at': time.time(),
-                                    'delivery': 'pending', 'attempts': [], 'ack': None}
+                                    'delivery': 'pending' if record['spec'].get('notify_argv') else 'available',
+                                    'attempts': [], 'ack': None}
     return event_id
 
 
@@ -378,7 +384,30 @@ def tick(root, record, *, error=False, now=None):
         return state
 
 
+def event_payload(root, record, entry):
+    if sha(entry['event']) != entry['event_digest']: raise ValueError('event changed')
+    command = [record['python'], record['runtime'] + '/dag_subscription.py', '--home', str(root.parent.parent)]
+    event_id = entry['event']['event_id']
+    return {'version': 1, 'consumer_id': record['spec']['consumer_id'],
+            'subscription_id': record['id'], 'event': entry['event'],
+            'event_digest': entry['event_digest'],
+            'ack_argv': command + ['ack', record['id'], event_id, entry['event_digest']]}
+
+
+def next_event(root, record):
+    state = load_state(root, record)
+    if state['status'] == 'unsubscribed': return None
+    for entry in state['events'].values():
+        if not entry['ack']: return event_payload(root, record, entry)
+    return None
+
+
 def deliver(root, record, event_id, *, redeliver=False):
+    if record['spec'].get('version') != 2:
+        raise ValueError('use the frozen runtime for legacy subscriptions')
+    if not record['spec'].get('notify_argv'):
+        if redeliver: raise ValueError('no delivery adapter configured')
+        return
     with lock(root / 'state.lock'):
         state = load_state(root, record)
         entry = state['events'][event_id]
@@ -394,19 +423,12 @@ def deliver(root, record, event_id, *, redeliver=False):
         attempt = {'pid': os.getpid(), 'process_identity': process_identity(os.getpid()), 'started_at': time.time()}
         entry['attempts'].append(attempt)
         save(root / 'state.json', state)
-        # No server/model text is interpolated into a wake message.
-        command = [record['python'], record['runtime'] + '/dag_subscription.py', '--home', str(root.parent.parent)]
-        message = (f'[homerail-dag-event {event_id}] {entry["event"]["kind"]}. '
-                   'Use $homerail-dag-ops event consumption instructions. '
-                   f'Subscription {record["id"]}; run {record["spec"]["run_id"]}. '
-                   f'Read event with {shlex.join(command + ["event", record["id"], event_id])}. '
-                   f'Verify event_digest {entry["event_digest"]} and current DAG identity, '
-                   f'then acknowledge with {shlex.join(command + ["ack", record["id"], event_id, entry["event_digest"]])}. '
-                   'Do not rerun the DAG or poll unchanged progress. Notification is not proof of task success.')
+        payload = event_payload(root, record, entry)
     try:
-        result = subprocess.run(record['spec']['notify_argv'] + ['--thread', record['spec']['thread'], '--message', message],
+        result = subprocess.run(record['spec']['notify_argv'],
+                                input=(json.dumps(payload, ensure_ascii=False) + '\n').encode(),
                                 env=dict(os.environ, **record['spec']['environment']),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
         outcome = 'accepted' if result.returncode == 0 else 'unknown'
         code = result.returncode
     except OSError:
@@ -434,7 +456,7 @@ def acknowledge(root, event_id, event_digest):
         if sha(entry['event']) != event_digest or entry['event_digest'] != event_digest:
             raise ValueError('event digest does not match')
         if entry['ack'] is None:
-            entry['ack'] = {'consumer': record['spec']['thread'], 'event_digest': event_digest, 'at': time.time()}
+            entry['ack'] = {'consumer': record['spec'].get('consumer_id', record['spec'].get('thread')), 'event_digest': event_digest, 'at': time.time()}
             save(root / 'state.json', state)
         return entry['ack']
 
@@ -462,9 +484,11 @@ def stream(spec):
             else: raise ValueError('unsupported SSE field')
 
 
-def run(root):
+def run(root, *, once=False):
     root = private(root)
     record = load_record(root)
+    if record['spec'].get('version') != 2:
+        raise ValueError('use the frozen runtime for legacy subscriptions')
     with lock(root / 'observer.lock', nonblocking=True):
         with lock(root / 'state.lock'):
             state = load_state(root, record)
@@ -476,14 +500,17 @@ def run(root):
                         entry['delivery'] = 'unknown'
             save(root / 'state.json', state)
         flush(root, record)
+        if once and (result := next_event(root, record)): return result
         backoff = 1
         while load_state(root, record)['status'] == 'watching':
             tick(root, record)
             flush(root, record)
+            if once and (result := next_event(root, record)): return result
             if load_state(root, record)['status'] != 'watching': break
             try:
                 reconcile_snapshot(root, record, fetch_snapshot(record['spec']))
                 flush(root, record)
+                if once and (result := next_event(root, record)): return result
                 if load_state(root, record)['status'] != 'watching': break
                 next_read = 0
                 for event in stream(record['spec']):
@@ -493,6 +520,7 @@ def run(root):
                         reconcile_snapshot(root, record, fetch_snapshot(record['spec']))
                         next_read = time.monotonic() + 5
                     tick(root, record); flush(root, record)
+                    if once and (result := next_event(root, record)): return result
                     if load_state(root, record)['status'] != 'watching': break
                 else:
                     # End of stream is a reconnect, never proof the DAG ended.
@@ -500,20 +528,43 @@ def run(root):
                 backoff = min(backoff * 2, 15)
             except (OSError, ValueError, KeyError, urllib.error.URLError):
                 tick(root, record, error=True); flush(root, record)
+                if once and (result := next_event(root, record)): return result
                 backoff = min(backoff * 2, 15)
             if load_state(root, record)['status'] == 'watching': time.sleep(backoff)
 
 
+def wait_for_event(root):
+    """Block in ordinary code until an unacknowledged event is ready.
+
+    Reuse a live observer when present; otherwise observe in this process.
+    Returning an event does not ACK it. No model, systemd or callback is required.
+    """
+    root = private(root)
+    record = load_record(root)
+    if record['spec'].get('version') != 2:
+        raise ValueError('use the frozen runtime for legacy subscriptions')
+    while True:
+        if result := next_event(root, record): return result
+        state = load_state(root, record)
+        if state['status'] != 'watching':
+            return {'subscription_id': record['id'], 'status': state['status'], 'event': None}
+        try:
+            if result := run(root, once=True): return result
+        except BlockingIOError:
+            time.sleep(.2)  # Waiter process only; never a model polling cycle.
+
+
 def unsubscribe(root, *, manage_service=True):
     record = load_record(root)
-    unit = Path(record['unit_dir']) / record['service']
-    if unit.exists() and unit.read_text() != unit_text(root, record):
-        raise ValueError('refusing to stop an unowned service')
+    if record['service']:
+        unit = Path(record['unit_dir']) / record['service']
+        if unit.exists() and unit.read_text() != unit_text(root, record):
+            raise ValueError('refusing to stop an unowned service')
     with lock(root / 'state.lock'):
         state = load_state(root, record)
         state['status'] = 'unsubscribed'
         save(root / 'state.json', state)
-    if manage_service:
+    if manage_service and record['service']:
         systemctl('disable', '--now', record['service'])
     return {'subscription_id': record['id'], 'status': 'unsubscribed', 'dag_mutated': False}
 
@@ -522,19 +573,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', default=str(Path(os.environ.get('HOMERAIL_HOME', str(Path.home() / '.homerail'))) / 'dag-subscriptions'))
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('register')  # Persist only; no service manager or adapter needed.
     sub.add_parser('install')  # Spec arrives on stdin, not credential-bearing argv.
-    for command in ('status', 'events', 'event', 'unsubscribe', 'run', 'ack', 'redeliver'):
+    for command in ('status', 'events', 'event', 'unsubscribe', 'run', 'wait', 'ack', 'redeliver'):
         p = sub.add_parser(command); p.add_argument('subscription')
         if command in ('event', 'ack', 'redeliver'): p.add_argument('event_id')
         if command in ('ack', 'redeliver'): p.add_argument('event_digest')
     args = parser.parse_args()
-    if args.command == 'install': result = install(Path(args.home), json.load(sys.stdin))
+    if args.command in ('register', 'install'):
+        result = install(Path(args.home), json.load(sys.stdin), manage_service=args.command == 'install')
     elif args.command == 'run': run(Path(args.subscription)); return
     else:
         if not re.fullmatch('[0-9a-f]{64}', args.subscription): raise ValueError('invalid subscription ID')
         root = Path(args.home).expanduser().resolve() / 'subscriptions' / args.subscription
         record = load_record(root)
-        if args.command == 'unsubscribe': result = unsubscribe(root)
+        if args.command == 'wait': result = wait_for_event(root)
+        elif args.command == 'unsubscribe': result = unsubscribe(root)
         elif args.command == 'ack': result = acknowledge(root, args.event_id, args.event_digest)
         elif args.command == 'redeliver':
             state = load_state(root, record); entry = state['events'][args.event_id]

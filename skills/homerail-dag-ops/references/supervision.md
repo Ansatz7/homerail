@@ -1,64 +1,78 @@
-# Background supervision and event consumption
+# Subscribe, await, and consume events
 
-Read this after obtaining a run ID for asynchronous Codex work, or on an event
-callback. The listener is a bundled ordinary process using existing HomeRail APIs.
+The current agent consumes DAG events using its existing tools. The skill does
+not select a supervisor model, start another agent, or require Codex, ChatGPT,
+Claude, a particular SDK, or a specific session API. Pick the transport the host
+actually supports, rather than assuming that a skill itself can wake a model.
 
-It requires Linux, Python 3.10+, user systemd with lingering already enabled,
-and a verified `codex queue --thread ... --message ...` transport. A one-shot
-`codex exec` can submit work, but delivery into that closed process is not a
-verified idle-task wakeup path. Keep a persistent destination task available.
-If requirements are missing, state what is unavailable; do not claim that a
-background wakeup has been registered.
+## Choose a supported waiting path
 
-## Register once
+- **Blocking tool/event result (default):** use the bundled `register` and `wait`
+  commands in [listener.md](listener.md). `wait` is one ordinary process call;
+  it remains silent until a meaningful event is available, then returns JSON.
+  The host awaits the tool and continues the same agent with its result. Do not
+  replace this with a model-driven loop of status calls or repeated short waits.
+- **Native host event subscription:** use the host's existing event tool or an
+  HTTP/SSE client against HomeRail's existing endpoints. Preserve run identity,
+  filtering, event receipt and consumption acknowledgment. A raw SSE chat delta
+  is not automatically an actionable decision.
+- **Optional push:** a verified adapter consumes the standard JSON event and
+  hands it to the host's own notification/continuation API. The adapter decides
+  whether the host queues, steers, or starts a continuation. These are host
+  capabilities, not guarantees made by the skill. See the generic adapter
+  contract in [listener.md](listener.md).
 
-1. Resolve the current Codex task ID, Manager origin, run ID and credentials.
-   Read [listener.md](listener.md) and register the private JSON spec using
-   `scripts/dag_subscription.py install` from this skill.
-2. Save the subscription ID and directory. Check compact `status` once and its
-   service is active, or confirm a terminal event has already been persisted.
-   If registration output is lost, retry the same spec and storage root.
-3. Tell the user what events will notify this task and **end the model turn**.
-   Do not add a goal loop, periodic model automation, or repeated tool waits.
+The bundled helper runs on Linux with Python 3.10+. The default `register`/
+`wait` path needs neither systemd nor a notification executable. A persistent
+user service is an optional deployment mode for hosts that need it. An agent
+without shell access may use a provided HTTP/SSE tool or an existing deployed
+bridge; a text-only conversation cannot create a lasting connection by itself.
 
-## Consume a wake event
+## Register and hand off waiting
 
-For a `[homerail-dag-event ...]` message:
+1. Resolve the Manager origin, actual run ID and a stable caller-chosen
+   `consumer_id` for this task. It need not be a harness thread ID. Store the
+   private subscription spec and register once. Reuse the same spec/store if
+   the response is lost; do not duplicate the DAG.
+2. Invoke the blocking `wait` tool, or verify the continuing observer and push
+   destination if using an adapter. Registration alone is not an active listener.
+3. Let the host wait without model inference. End the model turn only when a
+   verified persistent subscription/callback path will resume the agent. Do not
+   add periodic model automation, a goal loop, or a second agent executor.
 
-1. Read this skill and the **single event** using the command in the message.
-   Verify the subscription belongs to this task, and its event hash matches
-   the notification. The `ack` operation also enforces the hash. If already
-   acknowledged, end quietly; do not repeat prior side effects.
-2. Read current run metadata once from the registered Manager. Compare run ID,
-   creation time, workflow revision/hash, and creation request digest where
-   available with the pinned identity. Events are hints about persisted state;
-   approvals and metadata are separate reads, so recheck a proposal's current
-   status and hash before presenting or acting on it. Ignore stale decisions.
-3. Handle the reason:
-   - `terminal`: inspect relevant artifacts/handoffs and acceptance evidence.
-     A completed DAG is not by itself proof the user's task passed acceptance.
-   - `approval_required`: present the current proposal and hash to the human.
-     Notification/consumption acknowledgment does not approve the proposal.
-   - `command_required`: continue the existing run only within the user's
-     authorized task; otherwise ask for the missing decision. Record action
-     intent before submitting, and reconcile an ambiguous result before retry.
-   - `quiet_timeout` or `observation_unavailable`: make one bounded diagnosis.
-     These describe observation, not a failed DAG. The listener continues.
-   - `identity_mismatch`, `observation_deadline`, or `event_limit`: observation
-     has stopped. Explain the concrete limit or mismatch and reconcile current
-     state; do not silently rerun the DAG.
-4. Record the finding and any decision/action intent in the task receipt, then
-   `ack <subscription> <event> <digest>`. ACK means this event was consumed;
-   the DAG may still be waiting for a human. Do not wait for a user answer just
-   to ACK a notification already presented to them.
-5. End the turn when no further authorized action is ready. An approval ACK
-   leaves the listener active for later completion. Terminal observers exit.
+## Consume an event
 
-Use [listener.md](listener.md) for registration, explicit redelivery,
-stopping, and recovery. Use [acceptance.md](acceptance.md) when changing
-or validating this skill. All implementation and tests belong inside this skill.
+1. Read the single returned JSON event. Verify its consumer/subscription, run
+   identity and digest. If already acknowledged, do not repeat side effects.
+   For an optional callback, read the persisted event if needed to reconcile.
+2. Read current run metadata once. Compare run ID, creation time, workflow
+   revision/hash and creation request digest where available with the pinned
+   identity. Metadata and approvals are separate reads; recheck a proposal's
+   status/hash before presenting a decision, and ignore stale requests.
+3. Handle the current reason:
+   - `terminal`: verify artifacts/handoffs against task acceptance criteria.
+   - `approval_required`: present the proposal and hash to the authorized human.
+   - `command_required`: continue only within the user's authorization; otherwise
+     ask for the missing decision. Persist action intent and reconcile ambiguous
+     mutation results before retrying.
+   - `quiet_timeout` / `observation_unavailable`: make one bounded diagnosis;
+     these indicate an observation problem, not a failed DAG.
+   - `identity_mismatch` / `observation_deadline` / `event_limit`: observation
+     stopped. Explain the reason and reconcile without silently rerunning work.
+4. Record the finding and any decision/action intent, then acknowledge using
+   `ack <subscription> <event> <digest>` or the event's `ack_argv`. ACK means
+   consumed, not approved or successfully completed. It may follow presentation
+   of a decision request without waiting for the human's eventual answer.
+5. If work is still pending, await the next event using the same host mechanism.
+   A foreground `wait` exits after one event; call it again after consumption
+   when continuing supervision. A persistent observer continues through approval
+   ACKs and exits at a terminal outcome. Do not wake on unchanged progress.
 
-Callbacks from frozen runtimes installed under the former
-`homerail-dag-supervision` name use the same journal and ACK contract. Consume
-them with this skill and the absolute frozen-script path in the message; do
-not recreate an active subscription solely to rename its skill.
+## Older registrations
+
+Existing version-1 subscriptions used a harness-specific notification contract.
+Use their frozen absolute script paths to inspect/acknowledge/stop them; do not
+reinterpret their command arguments with the new helper. New registrations use
+version 2. If migrating active observation, reconcile its receipts and stop the
+owned old observer before registering a replacement. Do not change the DAG or
+silently start a second observer to work around a registration conflict.
