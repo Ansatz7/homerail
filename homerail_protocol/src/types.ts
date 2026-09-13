@@ -663,7 +663,7 @@ export interface DagAdvisorConfig {
 export interface DagWorkspaceAccess {
   writable_paths: string[];
   readonly_paths?: string[];
-  /** Overlay `.git` below the sole writable path as a read-only mount. */
+  /** Protect Git metadata inside writable paths (scoped Node mounts always protect existing metadata). */
   git_metadata_read_only?: boolean;
   max_snapshot_files?: number;
   /**

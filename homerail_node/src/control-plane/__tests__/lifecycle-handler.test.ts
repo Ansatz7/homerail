@@ -499,33 +499,42 @@ describe("handleLifecycleRequest", () => {
     });
 
     it("create worker mounts only the declared subtree writable", async () => {
-      process.env["HOMERAIL_HOME"] = "/home/user/.homerail";
-      const provider = new MockProvider();
-      const responses: LifecycleResponse[] = [];
+      const previousHome = process.env.HOMERAIL_HOME;
+      const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-node-legacy-scope-"));
+      process.env.HOMERAIL_HOME = tempHome;
+      fs.mkdirSync(path.join(tempHome, "workspace/run-isolated/fixers/fix/inv_0001/item_0001"), { recursive: true });
+      try {
+        const provider = new MockProvider();
+        const responses: LifecycleResponse[] = [];
 
-      await handleLifecycleRequest(
-        makeRequest({
-          resource_type: "worker",
-          operation: "create",
-          spec: {
-            workspace_id: "run-isolated",
-            workspace_read_only: true,
-            workspace_writable_subpath: "fixers/fix/inv_0001/item_0001",
-          },
-        }),
-        provider,
-        (message) => responses.push(message),
-      );
+        await handleLifecycleRequest(
+          makeRequest({
+            resource_type: "worker",
+            operation: "create",
+            spec: {
+              workspace_id: "run-isolated",
+              workspace_read_only: true,
+              workspace_writable_subpath: "fixers/fix/inv_0001/item_0001",
+            },
+          }),
+          provider,
+          (message) => responses.push(message),
+        );
 
-      expect(responses[0]!.status).toBe("success");
-      const container = provider.containers.get(String(responses[0]!.resource_data!.id));
-      expect(container!.config.mounts).toEqual(expect.arrayContaining([
-        expect.objectContaining({ container: "/workspace", mode: "ro" }),
-        expect.objectContaining({
-          container: "/workspace/fixers/fix/inv_0001/item_0001",
-          mode: "rw",
-        }),
-      ]));
+        expect(responses[0]!.status).toBe("success");
+        const container = provider.containers.get(String(responses[0]!.resource_data!.id));
+        expect(container!.config.mounts).toEqual(expect.arrayContaining([
+          expect.objectContaining({ container: "/workspace", mode: "ro" }),
+          expect.objectContaining({
+            container: "/workspace/fixers/fix/inv_0001/item_0001",
+            mode: "rw",
+          }),
+        ]));
+      } finally {
+        if (previousHome === undefined) delete process.env.HOMERAIL_HOME;
+        else process.env.HOMERAIL_HOME = previousHome;
+        fs.rmSync(tempHome, { recursive: true, force: true });
+      }
     });
 
     it("create worker overlays declared Git metadata read-only", async () => {
@@ -590,7 +599,7 @@ describe("handleLifecycleRequest", () => {
 
         expect(responses[0]).toMatchObject({
           status: "error",
-          error: { message: expect.stringContaining("regular file or directory") },
+          error: { message: expect.stringContaining("workspace symlink") },
         });
       } finally {
         if (previousHome === undefined) delete process.env.HOMERAIL_HOME;

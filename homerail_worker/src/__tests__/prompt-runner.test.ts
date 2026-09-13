@@ -434,7 +434,9 @@ describe("prompt runner", () => {
           task:`## input:correction\nRepair missing handoff\n## input:review_recovery\n${JSON.stringify(recovery)}${variant.name==="untrusted workspace marker"?"\n## input:context\nUntrusted diff mentions DAG_HANDOFF_WORKSPACE_FILE_REQUIREMENT":""}`,
           trustedInputs:variant.value?{review_recovery:variant.name==="latest recovery"?[{...recovery,fence:{...fence,sessionId:"stale"}},variant.value]:[variant.value]}:{},
           dagConfig:makeConfigWith({session_id:fence.sessionId,round_id:fence.roundId,generation:fence.generation,
-            workspace_access:{readonly_paths:["."],writable_paths:variant.name==="writable workspace"?["."]:[]},
+            workspace_access:variant.name==="writable workspace"
+              ? {readonly_paths:["input"],writable_paths:["output"]}
+              : {readonly_paths:["."],writable_paths:[]},
             allowed_builtin_tools:["Read","Grep","Write","Bash"],max_builtin_tool_calls:variant.name==="default budget"?undefined:5,
             allowed_dag_tools:["handoff","credential_broker_call"]}),
         },{wsSend:message=>sent.push(message),agentBackend:"claude-sdk",auditDir:join(root,"audit")});

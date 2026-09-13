@@ -12,7 +12,7 @@ import {
   sendWorkerRemoveRequest,
   type LifecycleResult,
 } from "./lifecycle-request.js";
-import type { DagWorkspaceInputProjection } from "homerail-protocol";
+import type { DagWorkspaceAccess, DagWorkspaceInputProjection } from "homerail-protocol";
 
 /* -------------------------------------------------------------------------- */
 /*  Public interfaces                                                         */
@@ -23,6 +23,7 @@ export interface ProvisionerOptions {
   workspace?: Record<string, unknown>;
   workspaceReadOnly?: boolean;
   workspaceWritableSubpath?: string;
+  workspaceAccess?: DagWorkspaceAccess;
   workspaceGitMetadataReadOnly?: boolean;
   workspaceInputs?: DagWorkspaceInputProjection[];
   /** Request the fixed Docker profile required by Codex's inner bwrap sandbox. */
@@ -45,6 +46,7 @@ export interface ProvisionerOptions {
       workspace?: Record<string, unknown>;
       workspaceReadOnly?: boolean;
       workspaceWritableSubpath?: string;
+      workspaceAccess?: DagWorkspaceAccess;
       workspaceGitMetadataReadOnly?: boolean;
       workspaceInputs?: DagWorkspaceInputProjection[];
       codexNestedSandbox?: boolean;
@@ -144,6 +146,7 @@ export async function provisionWorkerContainer(
     workspace: options?.workspace,
     workspaceReadOnly: options?.workspaceReadOnly,
     workspaceWritableSubpath: options?.workspaceWritableSubpath,
+    workspaceAccess: options?.workspaceAccess,
     workspaceGitMetadataReadOnly: options?.workspaceGitMetadataReadOnly,
     workspaceInputs: options?.workspaceInputs,
     codexNestedSandbox: options?.codexNestedSandbox,

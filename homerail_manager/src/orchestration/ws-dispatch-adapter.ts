@@ -1,3 +1,4 @@
+import { normalizeWorkspaceAccess } from "homerail-protocol";
 import type {
   DAGDispatcher,
   DispatchEnvelope,
@@ -118,7 +119,7 @@ function requiredCapabilitiesText(required: string[] | undefined): string {
 }
 
 function requiresIsolatedWorkspace(envelope: DispatchEnvelope): boolean {
-  return envelope.workspace?.mode === "isolated";
+  return envelope.workspaceAccess !== undefined || envelope.workspace?.mode === "isolated";
 }
 
 export function normalizeAgentBackend(agentType: string | undefined): string | undefined {
@@ -293,6 +294,10 @@ export class WsDispatchAdapter implements DAGDispatcher {
   }
 
   dispatch(envelope: DispatchEnvelope): DispatchResult {
+    if (envelope.workspaceAccess !== undefined) {
+      try { envelope = { ...envelope, workspaceAccess: normalizeWorkspaceAccess(envelope.workspaceAccess) }; }
+      catch (error) { return { status: "failed", reason: String(error), retryable: false }; }
+    }
     this._forgetDeferredOfflineDispatch(envelope.runId, envelope.nodeId);
     const requiredCapabilities = envelope.requiredCapabilities
       ?.map((capability) => capability.trim())
@@ -341,6 +346,9 @@ export class WsDispatchAdapter implements DAGDispatcher {
       }
     }
 
+    if (envelope.workspaceAccess !== undefined) {
+      return this._deferOfflineDispatch(envelope, "workspace_access requires a provisioned Docker Worker with scoped mounts");
+    }
     if (requiredCapabilities && requiredCapabilities.length > 0) {
       return this._deferOfflineDispatch(
         envelope,
@@ -605,21 +613,18 @@ export class WsDispatchAdapter implements DAGDispatcher {
     const codexNestedSandbox = agentBackend === "codex_appserver"
       && envelope.builtinToolPolicy === "backend_native";
     const workspaceInputs = dagWorkspaceInputProjections(envelope.runId);
-    const writablePaths = Array.isArray(envelope.workspaceAccess?.writable_paths)
-      ? envelope.workspaceAccess.writable_paths
-      : undefined;
-    const workspaceWritableSubpath = writablePaths?.length === 1
-      && writablePaths[0] !== "."
-      ? writablePaths[0]
-      : undefined;
+    const workspaceAccess = envelope.workspaceAccess === undefined
+      ? undefined : normalizeWorkspaceAccess(envelope.workspaceAccess);
+    const workspaceWritableSubpath = workspaceAccess?.writable_paths.length === 1
+      ? workspaceAccess.writable_paths[0] : undefined;
     const provisionerOpts: ProvisionerOptions = {
       ...this.provisionerOpts,
       image: envelope.image ?? this.provisionerOpts?.image,
       workspace: this.provisionerOpts?.workspace ?? envelope.workspace,
-      workspaceReadOnly: writablePaths !== undefined
-        && (writablePaths.length === 0 || workspaceWritableSubpath !== undefined),
+      workspaceReadOnly: workspaceAccess !== undefined,
+      workspaceAccess,
       ...(workspaceWritableSubpath === undefined ? {} : { workspaceWritableSubpath }),
-      ...(workspaceWritableSubpath === undefined || envelope.workspaceAccess?.git_metadata_read_only !== true
+      ...(workspaceAccess?.git_metadata_read_only !== true
         ? {}
         : { workspaceGitMetadataReadOnly: true }),
       codexNestedSandbox,
