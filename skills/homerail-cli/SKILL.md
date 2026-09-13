@@ -343,9 +343,21 @@ hr stats
 # Execution trace
 hr trace <run_id>
 
-# Inject an instruction into a running node
-hr inject <run_id> <node_id> "<instruction>" --mode inbox
 ```
+
+For an authorized instruction to an active actor, read
+`GET /api/runs/:id/actors`, then use `POST /api/runs/:id/commands` with the
+current `expected_round_id` and a command containing the actual `actor_id`,
+`expected_state_token`, a stable `idempotency_key`, and the workflow's typed
+`payload`. Authenticate using the existing private `x-homerail-dag-token`
+configuration. Inspect `GET /api/runs/:id/commands` and the actor's output to
+distinguish queued, applied and completed delivery. The Manager tool
+`send_dag_actor_command` is an alternative when available. Preserve the same
+key and payload when reconciling an uncertain submission.
+
+Legacy `hr inject` is unsupported and returns HTTP 409 / CLI exit 1 without
+delivering an instruction. See `docs/api/dag-live-commands.md` in the HomeRail
+source tree for the tracked request format.
 
 ## Asset Discovery
 

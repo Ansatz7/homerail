@@ -425,7 +425,7 @@ export function registerDagCommands(program: Command): void {
 
   program
     .command("inject <runId> <nodeId> <instruction>")
-    .description("Inject an instruction into a DAG node")
+    .description("Legacy instruction injection (unsupported); reports the delivery rejection")
     .option("--mode <mode>", "Legacy mode (unsupported); use the tracked run commands API", "inbox")
     .action(async (runId: string, nodeId: string, instruction: string, opts: { mode: string }) => {
       const globalOpts = program.opts<GlobalOpts>();

@@ -45,11 +45,23 @@ and the next actionable step.
 
 ## Continue the intended run
 
-For a correction to an executing node, verify inbox injection fits its contract:
+For an authorized correction to an executing actor, use tracked commands:
 
-```bash
-hr inject <run_id> <node_id> "<authorized correction>" --mode inbox
-```
+1. Read `GET /api/runs/:id/actors` for the actual actor ID, current round and
+   opaque actor state token.
+2. Submit `POST /api/runs/:id/commands` with `expected_round_id` and a `commands`
+   entry containing `actor_id`, `expected_state_token`, `idempotency_key` and
+   the workflow's typed `payload` (for instruction-based actors,
+   `{"instruction":"<authorized correction>"}`). Use the existing private
+   `x-homerail-dag-token` configuration. The Manager tool
+   `send_dag_actor_command` provides the same tracked operation when available.
+3. Read `GET /api/runs/:id/commands` for the receipt. Queued is not consumed;
+   verify applied/completed state and the actor's transcript/handoff. Reuse the
+   same idempotency key and payload after an uncertain submission; reread actor
+   state on a conflict before deciding a new intent.
+
+Legacy `hr inject` is unsupported: HTTP 409, `delivered:false`, CLI exit 1.
+It sends no correction. Do not retry it with another legacy mode.
 
 For waiting multi-Actor rounds, read
 [multi-actor-surfaces.md](multi-actor-surfaces.md) and use the actual Actor ids,

@@ -1,5 +1,5 @@
 /**
- * inject command — Inject an instruction into a DAG node
+ * Legacy inject command — report rejection and point to tracked actor commands.
  */
 
 import type { HomeRailClient } from "../client.js";
