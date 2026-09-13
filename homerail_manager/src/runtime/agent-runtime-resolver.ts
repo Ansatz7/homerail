@@ -254,6 +254,25 @@ export function resolveAgentRuntimeConfig(input: AgentRuntimeResolutionInput): A
         `Codex Responses model '${setting.provider_id}/${model}' does not support service tier '${serviceTier}'.`,
       );
     }
+  } else if (agentType === "claude-sdk") {
+    // Keep the scoped selector through preflight and every dispatch, including
+    // handoff correction. The Worker maps it to the SDK wire value exactly once.
+    // A false map explicitly disables effort, matching the Claude adapter.
+    reasoningEffort = reasoningEffortMap === false
+      ? undefined
+      : input.reasoningEffort?.trim() || defaultReasoningEffort;
+    if (reasoningEffort) {
+      if (reasoningEffortMap && !Object.prototype.hasOwnProperty.call(reasoningEffortMap, reasoningEffort)) {
+        throw new Error(
+          `Claude SDK model '${setting.provider_id}/${model}' does not support reasoning effort '${reasoningEffort}'. `
+          + `Supported values: ${Object.keys(reasoningEffortMap).join(", ")}.`,
+        );
+      }
+      const wireEffort = reasoningEffortMap ? reasoningEffortMap[reasoningEffort] : reasoningEffort;
+      if (wireEffort !== null && !["low", "medium", "high", "xhigh", "max"].includes(wireEffort)) {
+        throw new Error(`Claude SDK does not support reasoning effort wire value '${wireEffort}' for '${setting.provider_id}/${model}'.`);
+      }
+    }
   } else if (agentType === "deepseek_harness") {
     reasoningEffort = input.reasoningEffort?.trim() || defaultReasoningEffort;
     if (reasoningEffort && (reasoningEffortMap === undefined || reasoningEffortMap === false)) {
@@ -290,7 +309,7 @@ export function resolveAgentRuntimeConfig(input: AgentRuntimeResolutionInput): A
     runtime_placement: runtimePlacementForAgentType(agentType, input.surface),
     llm_setting_id: setting.id,
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-    ...(agentType === "deepseek_harness" && reasoningEffortMap !== undefined
+    ...((agentType === "deepseek_harness" || agentType === "claude-sdk") && reasoningEffortMap !== undefined
       ? { reasoning_effort_map: reasoningEffortMap }
       : {}),
     ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
