@@ -1,3 +1,4 @@
+import type { DagWorkspaceAccess } from "homerail-protocol";
 import type { ExecutionProvider, ContainerConfig, ContainerInfo } from "../providers/types.js";
 import { lstatSync } from "node:fs";
 import { validateMounts, allowedMounts, workerAllowedMounts } from "../storage/mount-policy.js";
@@ -45,6 +46,7 @@ export interface CreateWorkerOptions {
   workspaceId: string;
   workspaceReadOnly?: boolean;
   workspaceWritableSubpath?: string;
+  workspaceAccess?: DagWorkspaceAccess;
   workspaceGitMetadataReadOnly?: boolean;
   workspaceInputsReadOnly?: boolean;
   mountPolicy?: MountPolicyOptions;
@@ -59,6 +61,7 @@ export async function createWorkerContainer(opts: CreateWorkerOptions): Promise<
     workspaceId,
     workspaceReadOnly = false,
     workspaceWritableSubpath,
+    workspaceAccess,
     workspaceGitMetadataReadOnly = false,
     workspaceInputsReadOnly = false,
     mountPolicy,
@@ -78,8 +81,9 @@ export async function createWorkerContainer(opts: CreateWorkerOptions): Promise<
     workspaceInputsReadOnly,
     workspaceWritableSubpath,
     workspaceGitMetadataReadOnly,
+    workspaceAccess ?? (workspaceWritableSubpath === undefined ? undefined : { writable_paths: [workspaceWritableSubpath] }),
   );
-  if (workspaceGitMetadataReadOnly) {
+  if (workspaceGitMetadataReadOnly && workspaceAccess === undefined) {
     const metadataMount = defaultMounts.find((mount) => mount.container.endsWith("/.git"));
     if (!metadataMount) throw new Error("read-only Git metadata requires a writable workspace subtree");
     const metadata = lstatSync(metadataMount.host);

@@ -63,6 +63,7 @@ export interface PersistedCurrentDagRunRound {
 export interface PersistedDagRuntimeState {
   after_satisfied: Record<string, string[]>;
   input_satisfied: Record<string, string[]>;
+  routed_inputs?: Record<string, Array<{ fromNode: string; port: string; value: unknown }>>;
   mailboxes: Record<string, Record<string, unknown[]>>;
   loop_sources: string[];
 }

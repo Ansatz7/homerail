@@ -2,6 +2,7 @@ import {
   resolveConfiguredManagerAdminToken,
   resolveConfiguredManagerUrl,
 } from "./local-config.js";
+import { redactTelemetry } from "homerail-protocol";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export class HomeRailTransportError extends Error {
@@ -164,11 +165,9 @@ export class HomeRailClient {
     instruction: string,
     mode: string,
   ): Promise<BaseResponse> {
-    return this.post(`/api/runs/${encodeURIComponent(runId)}/inject`, {
-      node_id: nodeId,
-      instruction,
-      mode,
-    });
+    return this.request("POST", `/api/runs/${encodeURIComponent(runId)}/inject`, {
+      type: "json", value: { node_id: nodeId, instruction, mode },
+    }, undefined, true);
   }
 
   async checkpointResume(
@@ -199,6 +198,7 @@ export class HomeRailClient {
       | { type: "json"; value: unknown }
       | { type: "binary"; value: Uint8Array; contentType: string },
     timeoutMs?: number,
+    legacyInjectReceipt = false,
   ): Promise<T> {
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
       throw new TypeError("timeoutMs must be a finite positive number");
@@ -240,6 +240,14 @@ export class HomeRailClient {
         let message = `HTTP ${response.status}`;
         try {
           const errBody = (await response.json()) as Record<string, unknown>;
+          // Only this documented rejection is a receipt. Other HTTP failures
+          // retain normal error semantics; never turn a conflict into delivery.
+          if (legacyInjectReceipt && response.status === 409
+            && errBody?.error === "DAG_LEGACY_INJECT_UNSUPPORTED" && errBody.success === false
+            && errBody.data && typeof errBody.data === "object"
+            && (errBody.data as Record<string, unknown>).delivered === false) {
+            return redactTelemetry(redactReceiptCredentials(errBody, this.adminToken, this.mutationToken)) as T;
+          }
           if (typeof errBody.message === "string") {
             message = errBody.message;
           } else if (typeof errBody.error === "string") {
@@ -277,6 +285,16 @@ function isProtectedApiMutationRequest(method: string, pathValue: string): boole
   } catch {
     return false;
   }
+}
+
+function redactReceiptCredentials(value: unknown, adminToken?: string, mutationToken?: string): unknown {
+  if (typeof value === "string") return redactClientError(value, adminToken, mutationToken).message;
+  if (Array.isArray(value)) return value.map(item => redactReceiptCredentials(item, adminToken, mutationToken));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    redactClientError(key, adminToken, mutationToken).message,
+    redactReceiptCredentials(item, adminToken, mutationToken),
+  ]));
+  return value;
 }
 
 function redactClientError(

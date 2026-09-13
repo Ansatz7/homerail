@@ -52,6 +52,45 @@ describe("ClaudeSdkAdapter", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([false, true])("maps scoped effort on ordinary and correction queries (handoffOnly=%s)", async (handoffOnly) => {
+    const options: Record<string, unknown>[] = [];
+    vi.stubEnv("CLAUDE_CODE_EFFORT_LEVEL", "high");
+    vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({ ...makeFakeSdk(), async *query(params: { options: Record<string, unknown> }) {
+      options.push(params.options); yield { type: "result", subtype: "success" };
+    } }));
+    const { ClaudeSdkAdapter } = await import("../agent/claude-sdk.js");
+    const adapter = new ClaudeSdkAdapter();
+    for (const resumeSession of [false, true]) {
+      for await (const _event of adapter.run("test", [], { ...ctx, handoffOnly, resumeSession, reasoningEffort: "balanced", reasoningEffortMap: { balanced: "medium" } })) { /* drain */ }
+    }
+    expect(options).toHaveLength(2);
+    for (const option of options) {
+      expect(option.effort).toBe("medium");
+      expect(option.env).toMatchObject({ CLAUDE_CODE_EFFORT_LEVEL: "medium" });
+    }
+  });
+
+  it.each([undefined, false, { off: null }] as const)("defines default and disabled effort behavior (%s)", async (mapping) => {
+    let captured: Record<string, unknown> = {};
+    vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({ ...makeFakeSdk(), async *query(params: { options: Record<string, unknown> }) {
+      captured = params.options; yield { type: "result", subtype: "success" };
+    } }));
+    const { ClaudeSdkAdapter } = await import("../agent/claude-sdk.js");
+    for await (const _event of new ClaudeSdkAdapter().run("test", [], { ...ctx, reasoningEffort: mapping ? "off" : undefined, reasoningEffortMap: mapping })) { /* drain */ }
+    expect(captured.effort).toBeUndefined();
+    if (mapping !== undefined) expect(captured.env).toMatchObject({ CLAUDE_CODE_EFFORT_LEVEL: "unset" });
+  });
+
+  it("rejects unsupported effort without issuing a provider request", async () => {
+    const query = vi.fn();
+    vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({ ...makeFakeSdk(), query }));
+    const { ClaudeSdkAdapter } = await import("../agent/claude-sdk.js");
+    const events = [];
+    for await (const event of new ClaudeSdkAdapter().run("test", [], { ...ctx, reasoningEffort: "ultra" })) events.push(event);
+    expect(query).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("does not support reasoning effort") }));
+  });
+
   it("preserves tool-bearing assistant messages as progress and end-turn messages as final text", async () => {
     vi.doMock("@anthropic-ai/claude-agent-sdk", () =>
       makeFakeSdk([

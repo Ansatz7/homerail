@@ -1,3 +1,5 @@
+import { normalizeWorkspaceAccess } from "homerail-protocol";
+import { assertWorkspacePreparationBoundary } from "../storage/mount-policy.js";
 import type { ExecutionProvider, ContainerConfig } from "../providers/types.js";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -127,6 +129,12 @@ async function dispatchOperation(
       if (resource_type === "worker") {
         const workspaceId = spec.workspace_id as string;
         if (!workspaceId) throw new Error("spec.workspace_id is required for worker create");
+        const workspaceAccess = spec.workspace_access === undefined
+          ? undefined : normalizeWorkspaceAccess(spec.workspace_access);
+        if (spec.workspace_writable_subpath !== undefined && typeof spec.workspace_writable_subpath !== "string") {
+          throw new Error("workspace_writable_subpath must be a string");
+        }
+        if (workspaceAccess && spec.workspace_read_only !== true) throw new Error("workspace_access requires a read-only workspace root");
         const codexNestedSandbox = spec.codex_nested_sandbox === true;
         const config: ContainerConfig = {
           image: (spec.image as string) || "homerail-worker:latest",
@@ -150,6 +158,7 @@ async function dispatchOperation(
           workdir: (spec.workdir as string) || "/workspace",
           name: (spec.name as string) || undefined,
         };
+        if (workspaceAccess !== undefined || spec.workspace_writable_subpath !== undefined) assertWorkspacePreparationBoundary(workspaceId);
         const preparedWorkspace = await prepareWorkerWorkspace(workspaceId, spec.workspace);
         if (spec.workspace_read_only === true && preparedWorkspace.prepared) {
           await mkdir(join(preparedWorkspace.root, ".homerail-runtime"), { recursive: true, mode: 0o700 });
@@ -160,6 +169,7 @@ async function dispatchOperation(
           provider,
           workspaceId,
           workspaceReadOnly: spec.workspace_read_only === true,
+          workspaceAccess,
           workspaceWritableSubpath: typeof spec.workspace_writable_subpath === "string"
             ? spec.workspace_writable_subpath
             : undefined,

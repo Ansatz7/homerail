@@ -55,6 +55,7 @@ export interface SerializableRun {
     inputSatisfied?: ReadonlyMap<string, ReadonlySet<string>>;
     mailboxes?: ReadonlyMap<string, ReadonlyMap<string, readonly unknown[]>>;
     loopSources?: ReadonlySet<string>;
+    routedInputs?: ReadonlyMap<string, Array<{ fromNode: string; port: string; value: unknown }>>;
   };
 }
 
@@ -232,6 +233,7 @@ function _serializeDagRuntimeState(run: SerializableRun): PersistedDagRuntimeSta
     input_satisfied: _serializeSetMap(inputSatisfied),
     mailboxes: _serializeMailboxes(mailboxes),
     loop_sources: Array.from(loopSources).sort(),
+    ...(run.dagRun.routedInputs ? { routed_inputs: Object.fromEntries(run.dagRun.routedInputs) } : {}),
   };
 }
 

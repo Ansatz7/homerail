@@ -1016,7 +1016,11 @@ export function mutationRoutesHandler(
         }
         try {
           const result = changeOrchestrator.injectRun(runId, nodeId, instruction, mode);
-          _ok(res, "Instruction injected", result);
+          if (!result.delivered) {
+            json(res, 409, { success: false, message: result.delivery_gap ?? "Instruction was not delivered", data: result, error: "DAG_LEGACY_INJECT_UNSUPPORTED" });
+          } else {
+            _ok(res, "Instruction delivered", result);
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           if (message.includes("not found")) {

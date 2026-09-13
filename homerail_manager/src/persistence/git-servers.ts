@@ -226,6 +226,35 @@ export function createServer(input: CreateGitServerInput): GitServerPublic {
   return _public(record);
 }
 
+/** Update only public settings and the encrypted token. Empty optional strings
+ * clear their field; a cleared token invalidates the verification state. */
+export function updateServer(id: string, input: Record<string, unknown>): GitServerPublic | undefined {
+  const records = _readAll();
+  const rec = records.find(record => record.server_id === id);
+  if (!rec) return undefined;
+  const fields = new Set(["name", "token", "git_user_name", "git_user_email", "description", "is_active"]);
+  for (const [key, value] of Object.entries(input)) {
+    if (!fields.has(key)) throw new Error(`Unsupported Git server field: ${key}`);
+    if (key === "is_active") {
+      if (typeof value !== "boolean") throw new Error("is_active must be boolean");
+      rec.is_active = value;
+    } else {
+      if (typeof value !== "string") throw new Error(`${key} must be a string`);
+      if (key === "name" && !value.trim()) throw new Error("name must not be empty");
+      if (key === "name") rec.name = value.trim();
+      if (key === "description") rec.description = value.trim();
+      if (key === "git_user_name") rec.git_user_name = value.trim() || null;
+      if (key === "git_user_email") rec.git_user_email = value.trim() || null;
+      if (key === "token") {
+        rec.token = value.trim(); rec.token_valid = false; rec.last_verified = null; rec.user_info = null;
+      }
+    }
+  }
+  rec.updated_at = new Date().toISOString();
+  _writeAll(records);
+  return _public(rec);
+}
+
 export function deleteServer(id: string): boolean {
   const records = _readAll();
   const idx = records.findIndex((r) => r.server_id === id);
