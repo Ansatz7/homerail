@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import {
   CODEX_RESPONSES_PROTOCOL,
+  CODEX_SUBSCRIPTION_PROTOCOL,
   HOMERAIL_CODEX_MODEL_PROVIDER_ID,
   buildCodexProviderModelCatalogFromBundled,
   codexResponsesAppServerArgs,
@@ -27,6 +28,10 @@ import {
 import type { AgentClient, AgentEvent, AgentRunContext, DagToolDefinition } from "./types.js";
 import { sanitizedAgentChildEnv } from "./child-env.js";
 import { WORKER_RUNTIME_VERSION } from "../runtime-version.js";
+import {
+  nativeCodexArgs, nativeCodexEnvironment, nativeCodexRuntime, nativeCodexThreadConfig,
+  NativeCodexSessionStore, type NativeCodexRuntime,
+} from "./codex-subscription.js";
 
 const CLIENT_NAME = "homerail_codex_appserver";
 const CLIENT_TITLE = "HomeRail Codex AppServer Adapter";
@@ -356,6 +361,10 @@ export class CodexAppServerAdapter implements AgentClient {
   private providerRelay: CodexProviderRelay | null = null;
   private tempDir: string | null = null;
   private agentMessages = new Map<string, CodexAssistantMessageState>();
+  private nativeRuntime: NativeCodexRuntime | null = null;
+  private nativeSession: NativeCodexSessionStore | null = null;
+  private shutdownPromise: Promise<void> | null = null;
+  private nativePermissionProfile = "";
 
   constructor(
     codexBin?: string,
@@ -383,6 +392,14 @@ export class CodexAppServerAdapter implements AgentClient {
 
     // Validate codex binary
     try {
+      this.nativeRuntime = context.protocol === CODEX_SUBSCRIPTION_PROTOCOL ? nativeCodexRuntime(context) : null;
+      if (this.nativeRuntime) {
+        this.codexBin = this.nativeRuntime.bin;
+        this.nativePermissionProfile = `homerail-native-${randomBytes(12).toString("hex")}`;
+        if ((context.skillProjection?.directories?.length ?? 0) + (context.skillProjection?.definitions?.length ?? 0) > 0) {
+          throw new Error("Native Codex subscription does not yet support projected Skills");
+        }
+      }
       await this.validateBinary();
     } catch (err) {
       yield { type: "error", message: err instanceof Error ? err.message : String(err) };
@@ -401,7 +418,7 @@ export class CodexAppServerAdapter implements AgentClient {
         ? this.materializeProviderModelCatalog(context)
         : undefined;
       const env = this.buildEnv(context, this.providerRelay?.apiKey);
-      const args = context.protocol === CODEX_RESPONSES_PROTOCOL
+      const args = this.nativeRuntime ? nativeCodexArgs(this.nativeRuntime, this.tempDir!, this.nativePermissionProfile) : context.protocol === CODEX_RESPONSES_PROTOCOL
         ? codexResponsesAppServerArgs({
             providerName: context.provider,
             baseUrl: this.providerRelay?.baseUrl ?? context.baseUrl,
@@ -410,11 +427,12 @@ export class CodexAppServerAdapter implements AgentClient {
           })
         : ["app-server"];
       this.process = spawnProcess(this.codexBin, args, env);
+      this.shutdownPromise = null;
       this.notifications = [];
       this.notificationFailure = null;
       this.setupReadline();
     } catch (err) {
-      this.shutdown();
+      await this.shutdown();
       yield { type: "error", message: `Failed to start codex app-server: ${err}` };
       yield { type: "done" };
       return;
@@ -422,8 +440,12 @@ export class CodexAppServerAdapter implements AgentClient {
 
     let activeThreadId: string | undefined;
     let activeTurnId: string | undefined;
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
     const abortHandler = context.abortSignal
       ? () => {
+          if (this.nativeRuntime && !abortTimer) {
+            abortTimer = setTimeout(() => { void this.shutdown().catch(() => {}); }, 5_000);
+          }
           if (!activeThreadId || !activeTurnId) return;
           void this.sendRequest("turn/interrupt", {
             threadId: activeThreadId,
@@ -479,6 +501,7 @@ export class CodexAppServerAdapter implements AgentClient {
         },
       });
       yield this.debugEvent("appserver_initialized", this.redactSecrets(initResult));
+      if (this.nativeRuntime) this.sendNotification("initialized", {});
 
       const cwd = workingDirectory;
       const skillProjection = prepareCodexSkillProjection(context, this.tempDir!);
@@ -496,22 +519,33 @@ export class CodexAppServerAdapter implements AgentClient {
       }
 
       const dynamicTools = this.buildDynamicToolSpecs(tools);
-      const threadResult = await this.sendRequest("thread/start", {
+      const nativeConfig = this.nativeRuntime ? await this.prepareNativeThread(context, workingDirectory) : undefined;
+      if (context.abortSignal?.aborted) throw new Error("Codex turn cancelled before native execution");
+      if (this.nativeRuntime) this.nativeSession = new NativeCodexSessionStore(this.nativeRuntime, context, dynamicTools);
+      const saved = this.nativeSession?.read();
+      if (this.nativeRuntime && context.resumeSession && !saved) {
+        throw new Error("Required native Codex history binding is missing; refusing to create a replacement transcript");
+      }
+      const threadMethod = saved ? "thread/resume" : "thread/start";
+      const threadResult = await this.sendRequest(threadMethod, {
         // Preserve Codex's native harness instructions and supplement them
         // with the HomeRail DAG contract.
         baseInstructions: null,
         developerInstructions: context.systemPrompt ?? null,
         cwd,
         model: context.model,
-        modelProvider: context.protocol === CODEX_RESPONSES_PROTOCOL
+        modelProvider: this.nativeRuntime ? "openai" : context.protocol === CODEX_RESPONSES_PROTOCOL
           ? HOMERAIL_CODEX_MODEL_PROVIDER_ID
           : context.provider || null,
         approvalPolicy: "never",
-        sandbox: sandboxMode,
-        ephemeral: true,
-        dynamicTools,
+        ...(this.nativeRuntime ? { permissions: this.nativePermissionProfile } : { sandbox: sandboxMode }),
+        ...(saved ? { threadId: saved.threadId } : {
+          ephemeral: !this.nativeRuntime,
+          dynamicTools: this.nativeRuntime ? dynamicTools.map(tool => ({ type: "function", ...tool })) : dynamicTools,
+          ...(this.nativeRuntime ? { allowProviderModelFallback: false } : {}),
+        }),
         serviceTier: context.serviceTier ?? null,
-        ...(context.reasoningEffort
+        ...(nativeConfig ? { config: nativeConfig } : context.reasoningEffort
           ? { config: { model_reasoning_effort: context.reasoningEffort } }
           : {}),
       });
@@ -519,10 +553,23 @@ export class CodexAppServerAdapter implements AgentClient {
         (threadResult.thread_id as string | undefined) ??
         ((threadResult.thread as Record<string, unknown> | undefined)?.id as string | undefined);
       if (!threadId) {
-        throw new Error("thread/start response did not include a thread id");
+        throw new Error(`${threadMethod} response did not include a thread id`);
+      }
+      if (this.nativeRuntime) {
+        const sandbox = threadResult.sandbox as Record<string, unknown> | undefined;
+        const permissionProfile = threadResult.activePermissionProfile as Record<string, unknown> | undefined;
+        if (threadResult.model !== context.model || threadResult.modelProvider !== "openai"
+          || threadResult.reasoningEffort !== context.reasoningEffort || threadResult.approvalPolicy !== "never"
+          || sandbox?.type !== "readOnly" || sandbox.networkAccess === true
+          || permissionProfile?.id !== this.nativePermissionProfile || (saved && saved.threadId !== threadId)) {
+          throw new Error("Native Codex did not honor the selected model, reasoning, session, or read-only policy");
+        }
+        this.nativeSession!.save(threadId);
       }
       activeThreadId = threadId;
-      yield this.debugEvent("thread_created", { thread_id: threadId });
+      yield this.debugEvent(saved ? "thread_resumed" : "thread_created", {
+        thread_id: threadId, ...(this.nativeRuntime ? { persistent: true, billing: "native_subscription" } : {}),
+      });
 
       // Execute turns with iteration guard
       let iteration = 0;
@@ -539,12 +586,18 @@ export class CodexAppServerAdapter implements AgentClient {
           model: context.model,
           ...(context.reasoningEffort ? { effort: context.reasoningEffort } : {}),
           serviceTier: context.serviceTier ?? null,
+          ...(this.nativeRuntime ? {
+            approvalPolicy: "never",
+            permissions: this.nativePermissionProfile,
+          } : {}),
         });
         const turnId =
           (turnResult.turn_id as string | undefined) ??
           ((turnResult.turn as Record<string, unknown> | undefined)?.id as string | undefined) ??
           "";
         activeTurnId = turnId || undefined;
+        if (this.nativeRuntime && !activeTurnId) throw new Error("Native Codex turn was not acknowledged with a turn ID");
+        if (context.abortSignal?.aborted) abortHandler?.();
         yield this.debugEvent("turn_started", { turn_id: turnId, iteration });
 
         // Drain turn notifications
@@ -556,8 +609,7 @@ export class CodexAppServerAdapter implements AgentClient {
           } catch (err) {
             if (err instanceof NotificationWaitTimeoutError) {
               if (context.abortSignal?.aborted) {
-                turnComplete = true;
-                break;
+                throw new Error("Codex turn cancelled before terminal acknowledgement");
               }
               // A silent model may still be reasoning or waiting on its
               // provider. Emit a content-free heartbeat so the worker keeps
@@ -578,6 +630,23 @@ export class CodexAppServerAdapter implements AgentClient {
           const method = notification.method as string;
           const requestId = notification.id as number | undefined;
           const payload = notification.params as Record<string, unknown> | undefined;
+          if (this.nativeRuntime && payload?.threadId && payload.threadId !== threadId) continue;
+          if (this.nativeRuntime && payload?.turnId && payload.turnId !== turnId) continue;
+          if (this.nativeRuntime && requestId !== undefined && method !== "item/tool/call") {
+            // Never grant server-initiated permission, login, MCP or shell approval requests.
+            this.sendRpcError(requestId, "Native subscription Worker denies interactive requests");
+            throw new Error(`Native Codex requested an unsupported interactive operation: ${method}`);
+          }
+          if (this.nativeRuntime && requestId !== undefined && method === "item/tool/call" && !toolMap.has(String(payload?.tool))) {
+            this.sendRpcError(requestId, "Tool is not in the HomeRail allowlist");
+            throw new Error("Native Codex requested a tool outside the HomeRail allowlist");
+          }
+          if (this.nativeRuntime && method === "turn/completed") {
+            const turn = payload?.turn as Record<string, unknown> | undefined;
+            if (turn?.id !== turnId || turn.status !== "completed" || context.abortSignal?.aborted) {
+              throw new Error(`Native Codex turn ended without success (${String(turn?.status ?? "unknown")})`);
+            }
+          }
           const events = this.mapNotification(method, payload);
 
           for (const event of events) {
@@ -598,13 +667,6 @@ export class CodexAppServerAdapter implements AgentClient {
                 isError = true;
               }
 
-              yield {
-                type: "tool_result",
-                tool_use_id: event.id,
-                content,
-                is_error: isError,
-              };
-
               if (requestId !== undefined && method === "item/tool/call") {
                 this.sendResponse(requestId, {
                   contentItems: [{ type: "inputText", text: content }],
@@ -618,6 +680,14 @@ export class CodexAppServerAdapter implements AgentClient {
                   is_error: isError,
                 });
               }
+              // The consumer may stop iteration after a handoff/yield result.
+              // Deliver the native tool response before exposing that result.
+              yield {
+                type: "tool_result",
+                tool_use_id: event.id,
+                content,
+                is_error: isError,
+              };
             }
           }
 
@@ -633,7 +703,8 @@ export class CodexAppServerAdapter implements AgentClient {
         activeTurnId = undefined;
       }
 
-      if (iteration >= maxIterations) {
+      if (context.abortSignal?.aborted && this.nativeRuntime) throw new Error("Native Codex turn cancelled");
+      if (iteration >= maxIterations && !turnComplete) {
         yield { type: "error", message: `Exceeded max iterations (${maxIterations})` };
       }
 
@@ -649,11 +720,12 @@ export class CodexAppServerAdapter implements AgentClient {
         message: `Codex app-server error: ${err instanceof Error ? err.message : String(err)}`,
       };
     } finally {
+      if (abortTimer) clearTimeout(abortTimer);
       if (abortHandler && context.abortSignal) {
         context.abortSignal.removeEventListener("abort", abortHandler);
       }
-      yield this.debugEvent("appserver_done", { stderr_tail: stderr.slice(-2000) || null });
-      this.shutdown();
+      await this.shutdown();
+      yield this.debugEvent("appserver_done", { stderr_tail: this.nativeRuntime ? null : stderr.slice(-2000) || null });
     }
 
     yield { type: "done" };
@@ -700,6 +772,10 @@ export class CodexAppServerAdapter implements AgentClient {
   private sendResponse(id: number, result: Record<string, unknown>): void {
     if (!this.process?.stdin) return;
     this.process.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+  }
+
+  private sendRpcError(id: number, message: string): void {
+    this.process?.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message } })}\n`);
   }
 
   private setupReadline(): void {
@@ -777,13 +853,21 @@ export class CodexAppServerAdapter implements AgentClient {
     this.pending.clear();
   }
 
-  private shutdown(): void {
+  private shutdown(): Promise<void> {
+    this.shutdownPromise ??= this.closeProcess();
+    return this.shutdownPromise;
+  }
+
+  private async closeProcess(): Promise<void> {
     try {
       this.rl?.close();
     } catch {
       // ignore
     }
     this.rl = null;
+    const child = this.process;
+    const exited = this.nativeRuntime && child?.pid && child.exitCode === null && child.signalCode === null
+      ? new Promise<void>((resolve) => child.once("exit", () => resolve())) : undefined;
     try {
       this.process?.stdin?.end();
       this.process?.kill("SIGTERM");
@@ -796,7 +880,13 @@ export class CodexAppServerAdapter implements AgentClient {
     this.providerRelay = null;
     this.rejectAllPending("Adapter shutting down");
     this.rejectNotificationWaiters("Adapter shutting down");
+    if (exited) {
+      const timer = setTimeout(() => child?.kill("SIGKILL"), 2_000);
+      try { await exited; } finally { clearTimeout(timer); }
+    }
     this.cleanupTempDir();
+    this.nativeSession?.release();
+    this.nativeSession = null;
   }
 
   // --- Event mapping (mirrors Python _translate_notification) ---
@@ -970,6 +1060,7 @@ export class CodexAppServerAdapter implements AgentClient {
   }
 
   private buildEnv(context: AgentRunContext, providerApiKey = context.apiKey): Record<string, string | undefined> {
+    if (this.nativeRuntime) return nativeCodexEnvironment(this.nativeRuntime);
     const env = sanitizedAgentChildEnv();
     Object.assign(env, context.environmentVariables ?? {});
 
@@ -988,6 +1079,34 @@ export class CodexAppServerAdapter implements AgentClient {
     }
 
     return env;
+  }
+
+  private async prepareNativeThread(context: AgentRunContext, cwd: string): Promise<Record<string, unknown>> {
+    const auth = await this.sendRequest("account/read", { refreshToken: false });
+    if ((auth.account as Record<string, unknown> | undefined)?.type !== "chatgpt") {
+      throw new Error("Native Codex subscription requires an existing ChatGPT login; API fallback is disabled");
+    }
+    let cursor: string | undefined;
+    let selected: Record<string, unknown> | undefined;
+    do {
+      const page = await this.sendRequest("model/list", { ...(cursor ? { cursor } : {}), limit: 100 });
+      selected = (Array.isArray(page.data) ? page.data : []).find((model: Record<string, unknown>) => model.model === context.model);
+      cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+    } while (!selected && cursor);
+    const efforts = selected?.supportedReasoningEfforts as Array<Record<string, unknown>> | undefined;
+    if (!selected || !efforts?.some(e => e.reasoningEffort === context.reasoningEffort)) {
+      throw new Error("Selected native Codex model or reasoning effort is unavailable; fallback is disabled");
+    }
+    const resolved = await this.sendRequest("config/read", { includeLayers: false, cwd });
+    if (!resolved.config || typeof resolved.config !== "object") throw new Error("Could not verify native Codex configuration");
+    const skills = await this.sendRequest("skills/list", { cwds: [cwd], forceReload: true });
+    const skillPaths: string[] = [];
+    for (const entry of (Array.isArray(skills.data) ? skills.data : []) as Array<Record<string, unknown>>) {
+      for (const skill of (Array.isArray(entry.skills) ? entry.skills : []) as Array<Record<string, unknown>>) {
+        if (typeof skill.path === "string") skillPaths.push(skill.path);
+      }
+    }
+    return nativeCodexThreadConfig(resolved.config as Record<string, unknown>, skillPaths, this.tempDir!, context.reasoningEffort!, this.nativeRuntime!, this.nativePermissionProfile);
   }
 
   private materializeProviderModelCatalog(context: AgentRunContext): string | undefined {

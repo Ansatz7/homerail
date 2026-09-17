@@ -1,0 +1,210 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexAppServerAdapter } from "../agent/codex-appserver.js";
+import type { AgentEvent, AgentRunContext } from "../agent/types.js";
+
+const roots: string[] = [];
+
+function fixture(options: { account?: string; model?: string; status?: string; slowAck?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-codex-adapter-test-"));
+  roots.push(root);
+  const home = path.join(root, "native-home");
+  const state = path.join(root, "state");
+  const workspace = path.join(root, "workspace");
+  for (const dir of [home, state, workspace]) fs.mkdirSync(dir);
+  const log = path.join(root, "requests.jsonl");
+  const pidFile = path.join(root, "process.pid");
+  const bin = path.join(root, "codex");
+  // A real process and JSON-RPC transport: no model calls and no global host configuration.
+  fs.writeFileSync(bin, `#!${process.execPath}
+const fs = require('node:fs');
+const readline = require('node:readline');
+const options = ${JSON.stringify(options)};
+const log = ${JSON.stringify(log)};
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+const reply = (id, result) => process.stdout.write(JSON.stringify({id,result})+'\\n');
+const notify = (method, params) => process.stdout.write(JSON.stringify({method,params})+'\\n');
+const thread = (request) => ({thread:{id:'native-thread'},model:options.model||'exact-model',modelProvider:'openai',reasoningEffort:'low',approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:options.networkAccess||false},activePermissionProfile:{id:options.permissionMismatch?'unrestricted-user-profile':request.params.permissions}});
+readline.createInterface({input:process.stdin}).on('line',line=>{
+ const req=JSON.parse(line);fs.appendFileSync(log,JSON.stringify(req)+'\\n');
+ switch(req.method){
+ case 'initialize':reply(req.id,{});break;
+ case 'account/read':reply(req.id,{account:{type:options.account||'chatgpt'}});break;
+ case 'model/list':reply(req.id,{data:[{model:'exact-model',supportedReasoningEfforts:[{reasoningEffort:'low'}]}]});break;
+ case 'config/read':reply(req.id,{config:{mcp_servers:{ambient:{command:'never-run'}}}});break;
+ case 'skills/list':reply(req.id,{data:[{skills:[{path:'/ambient/skill/SKILL.md'}]}]});break;
+ case 'thread/start':reply(req.id,thread(req));break;
+ case 'thread/resume':
+   if(options.resumeError)process.stdout.write(JSON.stringify({id:req.id,error:{code:-1,message:'missing transcript'}})+'\\n');
+   else reply(req.id,thread(req));break;
+ case 'turn/start':
+   setTimeout(()=>{
+     reply(req.id,{turn:{id:'native-turn'}});
+     if(options.toolCall){
+       process.stdout.write(JSON.stringify({id:500,method:'item/tool/call',params:{threadId:'native-thread',turnId:'native-turn',callId:'native-handoff',tool:'handoff',arguments:{port:'done',content:'complete'}}})+'\\n');
+     }else if(!options.slowAck){
+       notify('item/completed',{threadId:'native-thread',turnId:'native-turn',item:{type:'agentMessage',phase:'final_answer',text:'verified result'}});
+       notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:options.status||'completed'}});
+     }
+   },options.slowAck?150:0);break;
+ case 'turn/interrupt':reply(req.id,{});notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:'interrupted'}});break;
+ case 'thread/unsubscribe':reply(req.id,{});break;
+ }
+});
+`, { mode: 0o700 });
+  vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_ENABLED", "1");
+  vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_HOME", home);
+  vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_STATE_DIR", state);
+  vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_BIN", bin);
+  const context: AgentRunContext = {
+    protocol: "codex_subscription", provider: "openai", model: "exact-model", reasoningEffort: "low",
+    apiKey: "", baseUrl: "", workspace, sessionId: "stable-run/node", codexSandbox: "read-only",
+    workspaceAccess: { writable_paths: [], readonly_paths: ["."] },
+  };
+  const requests = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  return { context, requests, state, home, pidFile };
+}
+
+async function collect(context: AgentRunContext): Promise<AgentEvent[]> {
+  const events: AgentEvent[] = [];
+  for await (const event of new CodexAppServerAdapter().run("Read only", [], context)) events.push(event);
+  return events;
+}
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const root of roots.splice(0)) fs.rmSync(root, { force: true, recursive: true });
+});
+
+describe("native Codex subscription transport", () => {
+  it("refuses to replace a required but missing native history binding", async () => {
+    const f = fixture();
+    expect(await collect({ ...f.context, resumeSession: true })).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("history binding is missing") }));
+    expect(f.requests().some(c => c.method === "thread/start" || c.method === "turn/start")).toBe(false);
+    expect(fs.readdirSync(f.state)).toHaveLength(0);
+  });
+  it("persists the native ID before turn ACK, resumes it across processes, and keeps restricted policy", async () => {
+    const f = fixture();
+    const first = await collect(f.context);
+    expect(first.some(e => e.type === "error")).toBe(false);
+    expect(first).toContainEqual({ type: "text", text: "verified result" });
+    expect(fs.readdirSync(f.state)).toHaveLength(1);
+    const second = await collect(f.context);
+    expect(second.some(e => e.type === "error")).toBe(false);
+    expect(second).toContainEqual(expect.objectContaining({ type: "debug", message: "thread_resumed" }));
+    const calls = f.requests();
+    expect(calls.filter(c => c.method === "thread/start")).toHaveLength(1);
+    expect(calls.filter(c => c.method === "thread/resume")).toHaveLength(1);
+    const start = calls.find(c => c.method === "thread/start").params;
+    expect(start).toMatchObject({ ephemeral: false, model: "exact-model", modelProvider: "openai", approvalPolicy: "never", allowProviderModelFallback: false });
+    expect(start).not.toHaveProperty("sandbox");
+    expect(start.config.mcp_servers.ambient.enabled).toBe(false);
+    expect(start.config.skills.config).toEqual([{ path: "/ambient/skill/SKILL.md", enabled: false }]);
+    const turn = calls.find(c => c.method === "turn/start").params;
+    expect(turn.permissions).toBe(start.permissions);
+    expect(typeof start.permissions).toBe("string");
+    expect(turn).not.toHaveProperty("sandboxPolicy");
+    const profile = start.config.permissions[start.permissions];
+    expect(profile.network.enabled).toBe(false);
+    expect(profile.filesystem).toMatchObject({
+      ":root": "deny", ":minimal": "read", [f.context.workspace!]: "read", [f.home]: "deny", [f.state]: "deny",
+    });
+  });
+
+  it.each(["apiKey", "amazonBedrock"])("refuses %s authentication before thread creation", async account => {
+    const f = fixture({ account });
+    const events = await collect(f.context);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("existing ChatGPT login") }));
+    expect(f.requests().some(c => c.method === "thread/start" || c.method === "turn/start")).toBe(false);
+  });
+
+  it("rejects unavailable model and reasoning without starting a thread", async () => {
+    const f = fixture();
+    expect(await collect({ ...f.context, reasoningEffort: "ultra" })).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("fallback is disabled") }));
+    expect(f.requests().some(c => c.method === "thread/start")).toBe(false);
+  });
+
+  it("rejects a server model substitution before any billable turn", async () => {
+    const f = fixture({ model: "different-model" });
+    expect(await collect(f.context)).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("did not honor") }));
+    expect(f.requests().some(c => c.method === "turn/start")).toBe(false);
+  });
+
+  it.each([{ permissionMismatch: true }, { networkAccess: true }])("rejects a server permission substitution before any turn %j", async option => {
+    const f = fixture(option);
+    expect(await collect(f.context)).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("did not honor") }));
+    expect(f.requests().some(c => c.method === "turn/start")).toBe(false);
+    expect(fs.readdirSync(f.state)).toHaveLength(0);
+  });
+
+  it.each(["failed", "interrupted"])("maps terminal %s to an error instead of successful completion", async status => {
+    const f = fixture({ status });
+    const events = await collect(f.context);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining(status) }));
+    expect(events.some(e => e.type === "turn_complete")).toBe(false);
+  });
+
+  it("cancels after a delayed turn ACK and retains the native session association", async () => {
+    const f = fixture({ slowAck: true });
+    const controller = new AbortController();
+    const result = collect({ ...f.context, abortSignal: controller.signal });
+    await vi.waitFor(() => expect(f.requests().some(c => c.method === "turn/start")).toBe(true));
+    expect(fs.readdirSync(f.state).some(file => file.endsWith(".json"))).toBe(true);
+    controller.abort();
+    const events = await result;
+    expect(f.requests()).toContainEqual(expect.objectContaining({ method: "turn/interrupt", params: { threadId: "native-thread", turnId: "native-turn" } }));
+    expect(events.some(e => e.type === "error")).toBe(true);
+    expect(fs.readdirSync(f.state)).toHaveLength(1);
+  });
+
+  it("never creates a replacement transcript after resume failure", async () => {
+    const f = fixture({ resumeError: true });
+    await collect(f.context);
+    expect(await collect(f.context)).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("missing transcript") }));
+    expect(f.requests().filter(c => c.method === "thread/start")).toHaveLength(1);
+    expect(f.requests().filter(c => c.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("acknowledges a handoff and releases the process and lease when its consumer stops at the tool result", async () => {
+    const f = fixture({ toolCall: true });
+    const authFile = path.join(f.home, "auth.json");
+    fs.writeFileSync(authFile, '{"testOnly":"preserve-native-account"}');
+    let sawResult = false;
+    try {
+      for await (const event of new CodexAppServerAdapter().run("Read only", [{
+        name: "handoff",
+        description: "Return the result",
+        input_schema: { type: "object" },
+        handler: async () => ({ content: [{ type: "text", text: "accepted" }] }),
+      }], f.context)) {
+        if (event.type !== "tool_result") continue;
+        sawResult = true;
+        // The consumer has not requested another generator event: the RPC ACK
+        // must already be on the pipe before exposing the handoff result.
+        await vi.waitFor(() => expect(f.requests()).toContainEqual({
+          jsonrpc: "2.0", id: 500,
+          result: { contentItems: [{ type: "inputText", text: "accepted" }], success: true },
+        }));
+        break;
+      }
+      expect(sawResult).toBe(true);
+      expect(fs.readdirSync(f.state)).toHaveLength(1);
+      expect(fs.readdirSync(f.state)[0]).toMatch(/\.json$/);
+      const pid = Number(fs.readFileSync(f.pidFile, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow();
+      const start = f.requests().find(c => c.method === "thread/start").params;
+      const filesystem = start.config.permissions[start.permissions].filesystem;
+      const scratch = Object.keys(filesystem).find(p => path.isAbsolute(p) && filesystem[p] === "read" && p !== f.context.workspace)!;
+      expect(fs.existsSync(scratch)).toBe(false);
+      expect(fs.readFileSync(authFile, "utf8")).toBe('{"testOnly":"preserve-native-account"}');
+    } finally {
+      // A regression must not leave a fixture process behind.
+      if (fs.existsSync(f.pidFile)) {
+        try { process.kill(Number(fs.readFileSync(f.pidFile, "utf8")), "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+    }
+  });
+});
