@@ -255,7 +255,12 @@ describe("native Codex subscription boundary", () => {
     const record = fs.readFileSync(recordPath(), "utf8");
     expect(Object.keys(JSON.parse(record)).sort()).toEqual(["binding", "threadId", "version"]);
     expect(record).not.toContain("synthetic-native-secret");
-    expect(fs.statSync(recordPath()).mode & 0o777).toBe(0o600);
+    if (process.platform === "win32") {
+      // Windows file modes only model the write bit, so 0o600 is not representable.
+      expect(fs.statSync(recordPath()).mode & 0o777).toBe(0o666);
+    } else {
+      expect(fs.statSync(recordPath()).mode & 0o777).toBe(0o600);
+    }
     expect(fs.readFileSync(transcript, "utf8")).toBe('{"type":"preserved-native-history"}\n');
     expect(fs.readFileSync(path.join(runtime.home, "auth.json"), "utf8")).toContain("synthetic-native-secret");
     expect(fs.readdirSync(runtime.stateDir)).toEqual([path.basename(recordPath())]);

@@ -7,8 +7,30 @@ import type { AgentEvent, AgentRunContext } from "../agent/types.js";
 
 const roots: string[] = [];
 
+// Test-only spawn launch boundary. Windows cannot exec an extensionless POSIX
+// shebang script, so only the current fixture binary is re-expressed as a real
+// Node child running the identical fixture source. Every other command, and
+// spawnSync, keep the actual implementation, and stdio JSON-RPC stays genuine.
+const launcher = vi.hoisted(() => ({ fixture: null as { bin: string; script: string } | null }));
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const forward = actual.spawn as unknown as (...call: unknown[]) => unknown;
+  const spawn = ((command: unknown, ...rest: unknown[]) => {
+    const [args, ...tail] = rest;
+    const launch = launcher.fixture;
+    if (launch && String(command) === launch.bin) {
+      // Same process, same args and options: only the interpreter is made explicit.
+      return forward(process.execPath, [launch.script, ...(Array.isArray(args) ? args as string[] : [])], ...tail);
+    }
+    return forward(command, ...rest);
+  }) as unknown as typeof actual.spawn;
+  return { ...actual, spawn };
+});
+
 function fixture(options: { account?: string; model?: string; status?: string; slowAck?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-codex-adapter-test-"));
+  // Windows runner temp roots arrive as 8.3 short names that the adapter resolves.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-codex-adapter-test-")));
   roots.push(root);
   const home = path.join(root, "native-home");
   const state = path.join(root, "state");
@@ -18,7 +40,7 @@ function fixture(options: { account?: string; model?: string; status?: string; s
   const pidFile = path.join(root, "process.pid");
   const bin = path.join(root, "codex");
   // A real process and JSON-RPC transport: no model calls and no global host configuration.
-  fs.writeFileSync(bin, `#!${process.execPath}
+  const script = `#!${process.execPath}
 const fs = require('node:fs');
 const readline = require('node:readline');
 const options = ${JSON.stringify(options)};
@@ -53,7 +75,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'thread/unsubscribe':reply(req.id,{});break;
  }
 });
-`, { mode: 0o700 });
+`;
+  fs.writeFileSync(bin, script, { mode: 0o700 });
+  if (process.platform === "win32") {
+    // Windows has no shebang execution: the launch boundary above runs this exact
+    // fixture source as a real Node child, so transport and PID identity hold.
+    const scriptFile = path.join(root, "native-codex-fixture.cjs");
+    fs.writeFileSync(scriptFile, script.replace(/^#![^\n]*\n/, ""), { mode: 0o700 });
+    launcher.fixture = { bin, script: scriptFile };
+  }
   vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_ENABLED", "1");
   vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_HOME", home);
   vi.stubEnv("HOMERAIL_CODEX_SUBSCRIPTION_STATE_DIR", state);
@@ -74,6 +104,7 @@ async function collect(context: AgentRunContext): Promise<AgentEvent[]> {
 }
 
 afterEach(() => {
+  launcher.fixture = null;
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { force: true, recursive: true });
 });
