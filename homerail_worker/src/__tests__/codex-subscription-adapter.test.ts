@@ -12,7 +12,7 @@ const roots: string[] = [];
 // shebang script, so only the current fixture binary is re-expressed as a real
 // Node child running the identical fixture source. Every other command, and
 // spawnSync, keep the actual implementation, and stdio JSON-RPC stays genuine.
-const launcher = vi.hoisted(() => ({ fixture: null as { bin: string; script: string } | null }));
+const launcher = vi.hoisted(() => ({ fixture: null as { bin: string; script: string } | null, frames: [] as Array<Record<string, unknown>> }));
 
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -20,11 +20,24 @@ vi.mock("node:child_process", async () => {
   const spawn = ((command: unknown, ...rest: unknown[]) => {
     const [args, ...tail] = rest;
     const launch = launcher.fixture;
-    if (launch && String(command) === launch.bin) {
-      // Same process, same args and options: only the interpreter is made explicit.
-      return forward(process.execPath, [launch.script, ...(Array.isArray(args) ? args as string[] : [])], ...tail);
+    const isFixture = launch && String(command) === launch.bin;
+    // Only Windows needs an explicit interpreter; Linux keeps real exec/shebang.
+    const child = (isFixture && process.platform === "win32"
+      ? forward(process.execPath, [launch.script, ...(Array.isArray(args) ? args as string[] : [])], ...tail)
+      : forward(command, ...rest)) as ReturnType<typeof actual.spawn>;
+    if (isFixture && child.stdin) {
+      const write = child.stdin.write.bind(child.stdin);
+      // Capture complete JSON-RPC writes on the parent side before shutdown can
+      // terminate the child. This asserts the attempted wire response, not a
+      // guarantee that a terminated child consumed it or flushed its log.
+      child.stdin.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+        for (const line of (typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8")).trim().split("\n")) {
+          if (line) launcher.frames.push(JSON.parse(line));
+        }
+        return (write as (...args: unknown[]) => boolean)(chunk, ...args);
+      }) as typeof child.stdin.write;
     }
-    return forward(command, ...rest);
+    return child;
   }) as unknown as typeof actual.spawn;
   return { ...actual, spawn };
 });
@@ -81,6 +94,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 });
 `;
   fs.writeFileSync(bin, script, { mode: 0o700 });
+  launcher.fixture = { bin, script: bin };
+  launcher.frames.length = 0;
   if (process.platform === "win32") {
     // Windows has no shebang execution: the launch boundary above runs this exact
     // fixture source as a real Node child, so transport and PID identity hold.
@@ -109,6 +124,7 @@ async function collect(context: AgentRunContext, tools: DagToolDefinition[] = []
 
 afterEach(() => {
   launcher.fixture = null;
+  launcher.frames.length = 0;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { force: true, recursive: true });
@@ -200,6 +216,7 @@ describe("native Codex subscription transport", () => {
       // Rejection shuts down the child; it need not flush a best-effort RPC
       // error into the fixture log before exit. Assert the permission boundary.
       expect(executed).toEqual([]);
+      expect(launcher.frames).toContainEqual(expect.objectContaining({ id: 500, error: expect.objectContaining({ message: expect.stringContaining("allowlist") }) }));
     }
   });
 
