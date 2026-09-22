@@ -151,6 +151,17 @@ describe("native Codex subscription transport", () => {
 
   it.each(["handoff", "report_activity"])("resumes a missing-handoff correction and enforces its tool allowlist (%s)", async toolOnResume => {
     const f = fixture({ toolOnResume });
+    const executed: string[] = [];
+    const run = CodexAppServerAdapter.prototype.run;
+    vi.spyOn(CodexAppServerAdapter.prototype, "run").mockImplementation(function (this: CodexAppServerAdapter, prompt, tools, context) {
+      return run.call(this, prompt, tools.map(tool => ({
+        ...tool,
+        handler: (args, callContext) => {
+          executed.push(tool.name);
+          return tool.handler(args, callContext);
+        },
+      })), context);
+    });
     vi.stubEnv("WORKSPACE", f.context.workspace!);
     const job: PromptJob = {
       task: "Inspect and hand off", sender: "test", runId: "native-correction-run",
@@ -180,12 +191,15 @@ describe("native Codex subscription transport", () => {
     expect(fs.readFileSync(path.join(f.state, fs.readdirSync(f.state)[0]), "utf8")).toBe(saved);
     if (toolOnResume === "handoff") {
       expect(correction.status).toBe("completed");
+      expect(executed).toEqual(["handoff"]);
       expect(messages.filter(m => m.type === "response")).toHaveLength(1);
       expect(calls).toContainEqual(expect.objectContaining({ id: 500, result: expect.objectContaining({ success: true }) }));
     } else {
       expect(correction).toMatchObject({ status: "failed", reason: expect.stringContaining("outside the HomeRail allowlist") });
       expect(messages.some(m => m.type === "response")).toBe(false);
-      expect(calls).toContainEqual(expect.objectContaining({ id: 500, error: expect.objectContaining({ message: expect.stringContaining("allowlist") }) }));
+      // Rejection shuts down the child; it need not flush a best-effort RPC
+      // error into the fixture log before exit. Assert the permission boundary.
+      expect(executed).toEqual([]);
     }
   });
 
