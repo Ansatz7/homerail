@@ -650,7 +650,10 @@ export async function runPrompt(
       sessionId: job.llmProtocol === CODEX_SUBSCRIPTION_PROTOCOL
         ? JSON.stringify([job.runId, job.dagConfig.node_id])
         : job.dagConfig.session_id ?? job.runId,
-      ...(job.llmProtocol === CODEX_SUBSCRIPTION_PROTOCOL ? { resumeSession: job.nativeSessionRequired === true } : {}),
+      ...(job.llmProtocol === CODEX_SUBSCRIPTION_PROTOCOL ? {
+        resumeSession: job.nativeSessionRequired === true,
+        nativeSessionTools: selectedDagTools.map(({ name, description, input_schema }) => ({ name, description, input_schema })),
+      } : {}),
       abortSignal: deps.abortSignal,
       turnController: deps.turnController,
       handoffOnly: correctionOnly && !correctionRepairsWorkspaceEvidence && !readOnlyReviewRecovery,

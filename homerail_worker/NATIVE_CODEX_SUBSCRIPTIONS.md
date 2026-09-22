@@ -79,3 +79,11 @@ The configuration follows the official [permission-profile documentation](https:
 and [app-server lifecycle](https://learn.chatgpt.com/docs/app-server). Compatibility
 must be checked against the actual installed binary; generated schemas alone do
 not prove that legacy request fields remain accepted.
+
+Correction turns retain the original native thread and its fixed DAG tool
+declarations. The session binding includes the full declared tool schema; changing
+that schema, model, account directory, or workspace still fails closed. A
+correction may narrow the executable DAG tool handlers to handoff: calls to tools
+outside that turn's allowlist are rejected even if the native thread remembers
+their declarations. This restriction concerns HomeRail dynamic tools; the native
+built-in tools remain governed by the explicit read-only sandbox policy.

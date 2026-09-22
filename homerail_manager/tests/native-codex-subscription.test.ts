@@ -14,6 +14,7 @@ import { _clearActiveRuns, getActiveRun, handoffActiveRun, requestNodeCorrection
 import { preflightDagAgentRuntimes } from "../src/runtime/dag-runtime-preflight.js";
 import { resolveNativeSubscriptionAgent, usesOnlyNativeSubscriptionWorkers } from "../src/runtime/native-subscription-runtime.js";
 import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
+import { stageDagRunInputArtifact, resolveDagRunInputBindings, bindDagRunInputs } from "../src/persistence/run-input-artifacts.js";
 import { closeDb } from "../src/persistence/db.js";
 import { loadRunMetadata } from "../src/persistence/store.js";
 import { upsertDagWorkflowFromYaml, upsertDagRuntimeProfileFromYaml, applyDagRuntimeProfile } from "../src/persistence/dag-workflows.js";
@@ -119,6 +120,48 @@ describe("explicit native Codex subscription DAGs", () => {
     expect(() => orchestrator.createRun({ workflowId: "native-proof", llmSettingId: "any-api-setting" })).toThrow(/llmSettingId cannot override/);
     upsertDagRuntimeProfileFromYaml({ workflow_id: "native-proof", yaml_text: "profile_id: override\ndefault: { agent_type: deterministic }" });
     expect(() => orchestrator.createRun({ workflowId: "native-proof", profile: "override" })).toThrow(/cannot override/);
+  });
+
+  it.each([false, true])("rejects input artifacts before persisting or dispatching a native run (mixed=%s)", mixed => {
+    const source = workflow();
+    if (mixed) {
+      Object.assign(source.spec.agents, { other: { system: "Another role" } });
+      Object.assign(source.spec.nodes, { other: { kind: "agent", agent: "other", inputs: { result: {} }, outputs: { result: {} } } });
+      source.spec.edges[0].to = "other.result";
+      source.spec.edges.push({ from: "other.result", to: "done.result" });
+    }
+    upsertDagWorkflowFromYaml({ yaml_text: JSON.stringify(source) });
+    const artifact = stageDagRunInputArtifact({ scope_id: "test", name: "task.txt", media_type: "text/plain", content: "input" });
+    const dispatcher = new FakeDAGDispatcher();
+    const orchestrator = new ChangeOrchestrator(new GraphExecutor(dispatcher));
+    expect(() => orchestrator.createAndRun({
+      workflowId: "native-proof", runId: "native-input", inputScope: "test",
+      inputArtifacts: [{ artifact_id: artifact.artifact_id, logical_name: "task", mount_path: "input/task.txt" }],
+    })).toThrow(/native_subscription does not support run input artifact projections/);
+    expect(loadRunMetadata("native-input")).toBeUndefined();
+    expect(getActiveRun("native-input")).toBeUndefined();
+    expect(dispatcher.dispatched).toHaveLength(0);
+  });
+
+  it("retains a metadata-only dispatch guard for previously persisted native runs with inputs", () => {
+    const artifact = stageDagRunInputArtifact({ scope_id: "test", name: "task.txt", media_type: "text/plain", content: "input" });
+    const bindings = resolveDagRunInputBindings("test", [{ artifact_id: artifact.artifact_id, logical_name: "task", mount_path: "input/task.txt" }]);
+    upsertDagWorkflowFromYaml({ yaml_text: JSON.stringify(workflow()) });
+    new ChangeOrchestrator(new GraphExecutor(new FakeDAGDispatcher())).createRun({ workflowId: "native-proof", runId: "legacy-input" });
+    bindDagRunInputs("legacy-input", bindings);
+    const read = vi.spyOn(fs, "readFileSync");
+    const nativeSend = node("native", [NATIVE_CODEX_SUBSCRIPTION_CAPABILITY]);
+    const adapter = new WsDispatchAdapter({ provisioner: {} });
+    const result = adapter.dispatch({
+      runId: "legacy-input", nodeId: "inspect", agentId: "inspect", inputs: {}, outgoingEdges: [],
+      agentConfig: resolveNativeSubscriptionAgent({ native_subscription: selection }),
+      codexSandbox: "read-only", builtinToolPolicy: "backend_native", workspaceAccess: { writable_paths: [] },
+    });
+    try {
+      expect(result).toMatchObject({ status: "failed", retryable: false, reason: expect.stringContaining("projected workspace inputs") });
+      expect(read).not.toHaveBeenCalled();
+      expect(nativeSend).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); }
   });
 
   it("rejects dynamic appends that replace native agent selection before changing the graph", () => {
@@ -287,6 +330,15 @@ describe("explicit native Codex subscription DAGs", () => {
       Object.assign(getNode("disconnected")!.socket, { readyState: WebSocket.CLOSED });
       expect((await post("/api/runs/create-and-run", request)).status).toBe(503);
       node("native", [NATIVE_CODEX_SUBSCRIPTION_CAPABILITY]);
+      const artifact = stageDagRunInputArtifact({ scope_id: "http-test", name: "task.txt", media_type: "text/plain", content: "input" });
+      const rejected = await post("/api/runs/create-and-run", {
+        ...request, runId: "native-http-input", input_scope: "http-test",
+        input_artifacts: [{ artifact_id: artifact.artifact_id, logical_name: "task", mount_path: "input/task.txt" }],
+      });
+      expect(rejected.status).toBe(400);
+      expect(JSON.stringify(await rejected.json())).toContain("native_subscription does not support run input artifact projections");
+      expect(loadRunMetadata("native-http-input")).toBeUndefined();
+      expect(dispatcher.dispatched).toHaveLength(0);
       const created = await post("/api/runs/create-and-run", request);
       expect(created.status).toBe(201);
       expect(dispatcher.dispatched).toHaveLength(1);

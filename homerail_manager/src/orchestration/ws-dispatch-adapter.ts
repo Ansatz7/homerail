@@ -61,7 +61,7 @@ import {
   summarizeDagWorkerSkillContextV1,
 } from "homerail-protocol";
 import WebSocket from "ws";
-import { dagWorkspaceInputProjections } from "../persistence/run-input-artifacts.js";
+import { dagWorkspaceInputProjections, listDagRunInputs } from "../persistence/run-input-artifacts.js";
 
 const OFFLINE_RETRY_MIN_MS = 1_000;
 const OFFLINE_RETRY_MAX_MS = 30_000;
@@ -152,7 +152,7 @@ function assertNativeSubscriptionEnvelope(envelope: DispatchEnvelope): void {
     credentials: envelope.credentialProjections,
     advisors: envelope.advisors,
   });
-  if (envelope.image || envelope.container_group || dagWorkspaceInputProjections(envelope.runId).length > 0) {
+  if (envelope.image || envelope.container_group || listDagRunInputs(envelope.runId).length > 0) {
     throw new Error("native_subscription does not support container configuration or projected workspace inputs");
   }
 }
@@ -698,7 +698,7 @@ export class WsDispatchAdapter implements DAGDispatcher {
     const nativeSubscription = isNativeSubscription(envelope);
     const codexNestedSandbox = agentBackend === "codex_appserver"
       && envelope.builtinToolPolicy === "backend_native";
-    const workspaceInputs = dagWorkspaceInputProjections(envelope.runId);
+    const workspaceInputs = nativeSubscription ? [] : dagWorkspaceInputProjections(envelope.runId);
     const workspaceAccess = envelope.workspaceAccess === undefined
       ? undefined : normalizeWorkspaceAccess(envelope.workspaceAccess);
     const workspaceWritableSubpath = workspaceAccess?.writable_paths.length === 1

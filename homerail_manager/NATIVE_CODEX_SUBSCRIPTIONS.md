@@ -51,7 +51,9 @@ configure other agents, but a default or explicit profile entry targeting a
 subscription agent is rejected. Read-only sandbox/workspace and native tools are
 mandatory; credential injection, advisors, dispatch-scoped sessions, container
 images and groups are unsupported. This initial Manager path also rejects run
-input artifact projections; an isolated verification harness can prepare files
+input artifact projections at run creation, including mixed native/API workflows.
+The dispatch guard also rejects bindings on previously persisted runs. An
+isolated verification harness can prepare files
 in the Node's run workspace before execution.
 
 Configure the trusted Node as described in

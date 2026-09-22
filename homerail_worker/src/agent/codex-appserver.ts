@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import {
+  type AgentToolDefinition,
   CODEX_RESPONSES_PROTOCOL,
   CODEX_SUBSCRIPTION_PROTOCOL,
   HOMERAIL_CODEX_MODEL_PROVIDER_ID,
@@ -519,9 +520,19 @@ export class CodexAppServerAdapter implements AgentClient {
       }
 
       const dynamicTools = this.buildDynamicToolSpecs(tools);
+      // A native thread retains its declared tools across resumes. Corrections
+      // narrow the executable handlers, not that stable transcript identity.
+      const sessionTools = this.nativeRuntime && context.nativeSessionTools
+        ? this.buildDynamicToolSpecs(context.nativeSessionTools) : dynamicTools;
+      if (this.nativeRuntime) {
+        const declarations = new Map(sessionTools.map(tool => [tool.name, JSON.stringify(tool)]));
+        if (declarations.size !== sessionTools.length || dynamicTools.some(tool => declarations.get(tool.name) !== JSON.stringify(tool))) {
+          throw new Error("Native Codex turn tools must match the stable session declarations");
+        }
+      }
       const nativeConfig = this.nativeRuntime ? await this.prepareNativeThread(context, workingDirectory) : undefined;
       if (context.abortSignal?.aborted) throw new Error("Codex turn cancelled before native execution");
-      if (this.nativeRuntime) this.nativeSession = new NativeCodexSessionStore(this.nativeRuntime, context, dynamicTools);
+      if (this.nativeRuntime) this.nativeSession = new NativeCodexSessionStore(this.nativeRuntime, context, sessionTools);
       const saved = this.nativeSession?.read();
       if (this.nativeRuntime && context.resumeSession && !saved) {
         throw new Error("Required native Codex history binding is missing; refusing to create a replacement transcript");
@@ -541,7 +552,7 @@ export class CodexAppServerAdapter implements AgentClient {
         ...(this.nativeRuntime ? { permissions: this.nativePermissionProfile } : { sandbox: sandboxMode }),
         ...(saved ? { threadId: saved.threadId } : {
           ephemeral: !this.nativeRuntime,
-          dynamicTools: this.nativeRuntime ? dynamicTools.map(tool => ({ type: "function", ...tool })) : dynamicTools,
+          dynamicTools: this.nativeRuntime ? sessionTools.map(tool => ({ type: "function", ...tool })) : dynamicTools,
           ...(this.nativeRuntime ? { allowProviderModelFallback: false } : {}),
         }),
         serviceTier: context.serviceTier ?? null,
@@ -1215,7 +1226,7 @@ export class CodexAppServerAdapter implements AgentClient {
     );
   }
 
-  private buildDynamicToolSpecs(tools: DagToolDefinition[]): Array<Record<string, unknown>> {
+  private buildDynamicToolSpecs(tools: AgentToolDefinition[]): Array<Record<string, unknown>> {
     return tools.map((tool) => ({
       name: tool.name,
       description: tool.description,

@@ -3,7 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexAppServerAdapter } from "../agent/codex-appserver.js";
-import type { AgentEvent, AgentRunContext } from "../agent/types.js";
+import { runPrompt, type PromptJob } from "../prompt-runner.js";
+import type { AgentEvent, AgentRunContext, DagToolDefinition } from "../agent/types.js";
 
 const roots: string[] = [];
 
@@ -28,7 +29,7 @@ vi.mock("node:child_process", async () => {
   return { ...actual, spawn };
 });
 
-function fixture(options: { account?: string; model?: string; status?: string; slowAck?: boolean; silent?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
+function fixture(options: { toolOnResume?: string; account?: string; model?: string; status?: string; slowAck?: boolean; silent?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
   // Windows runner temp roots arrive as 8.3 short names that the adapter resolves.
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-codex-adapter-test-")));
   roots.push(root);
@@ -45,12 +46,14 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 const options = ${JSON.stringify(options)};
 const log = ${JSON.stringify(log)};
+let resumed = false;
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
 const reply = (id, result) => process.stdout.write(JSON.stringify({id,result})+'\\n');
 const notify = (method, params) => process.stdout.write(JSON.stringify({method,params})+'\\n');
 const thread = (request) => ({thread:{id:'native-thread'},model:options.model||'exact-model',modelProvider:'openai',reasoningEffort:'low',approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:options.networkAccess||false},activePermissionProfile:{id:options.permissionMismatch?'unrestricted-user-profile':request.params.permissions}});
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const req=JSON.parse(line);fs.appendFileSync(log,JSON.stringify(req)+'\\n');
+ if(req.id===500 && req.result && options.toolOnResume)notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:'completed'}});
  switch(req.method){
  case 'initialize':reply(req.id,{});break;
  case 'account/read':reply(req.id,{account:{type:options.account||'chatgpt'}});break;
@@ -59,13 +62,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'skills/list':reply(req.id,{data:[{skills:[{path:'/ambient/skill/SKILL.md'}]}]});break;
  case 'thread/start':reply(req.id,thread(req));break;
  case 'thread/resume':
+   resumed=true;
    if(options.resumeError)process.stdout.write(JSON.stringify({id:req.id,error:{code:-1,message:'missing transcript'}})+'\\n');
    else reply(req.id,thread(req));break;
  case 'turn/start':
    setTimeout(()=>{
      reply(req.id,{turn:{id:'native-turn'}});
-     if(options.toolCall){
-       process.stdout.write(JSON.stringify({id:500,method:'item/tool/call',params:{threadId:'native-thread',turnId:'native-turn',callId:'native-handoff',tool:'handoff',arguments:{port:'done',content:'complete'}}})+'\\n');
+     if(options.toolCall || (resumed && options.toolOnResume)){
+       process.stdout.write(JSON.stringify({id:500,method:'item/tool/call',params:{threadId:'native-thread',turnId:'native-turn',callId:'native-handoff',tool:options.toolOnResume||'handoff',arguments:{port:'done',content:'complete'}}})+'\\n');
      }else if(!options.slowAck && !options.silent){
        notify('item/completed',{threadId:'native-thread',turnId:'native-turn',item:{type:'agentMessage',phase:'final_answer',text:'verified result'}});
        notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:options.status||'completed'}});
@@ -97,14 +101,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   return { context, requests, state, home, pidFile };
 }
 
-async function collect(context: AgentRunContext): Promise<AgentEvent[]> {
+async function collect(context: AgentRunContext, tools: DagToolDefinition[] = []): Promise<AgentEvent[]> {
   const events: AgentEvent[] = [];
-  for await (const event of new CodexAppServerAdapter().run("Read only", [], context)) events.push(event);
+  for await (const event of new CodexAppServerAdapter().run("Read only", tools, context)) events.push(event);
   return events;
 }
 
 afterEach(() => {
   launcher.fixture = null;
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { force: true, recursive: true });
 });
@@ -142,6 +147,59 @@ describe("native Codex subscription transport", () => {
     expect(profile.filesystem).toMatchObject({
       ":root": "deny", ":minimal": "read", [f.context.workspace!]: "read", [f.home]: "deny", [f.state]: "deny",
     });
+  });
+
+  it.each(["handoff", "report_activity"])("resumes a missing-handoff correction and enforces its tool allowlist (%s)", async toolOnResume => {
+    const f = fixture({ toolOnResume });
+    vi.stubEnv("WORKSPACE", f.context.workspace!);
+    const job: PromptJob = {
+      task: "Inspect and hand off", sender: "test", runId: "native-correction-run",
+      nativeSessionRequired: false, llmProvider: "openai", llmProtocol: "codex_subscription",
+      dagConfig: {
+        node_id: "reader", agent_type: "codex_appserver", model: "exact-model", reasoning_effort: "low",
+        codex_sandbox: "read-only", builtin_tool_policy: "backend_native",
+        workspace_access: { writable_paths: [], readonly_paths: ["."] },
+        incoming_edges: [], outgoing_edges: [{ from_port: "done", to_node: "result", to_port: "in" }],
+        graph_nodes: ["reader", "result"], allowed_dag_tools: ["handoff", "report_activity"],
+      },
+    };
+    const messages: Array<Record<string, any>> = [];
+    const deps = { agentBackend: "codex_appserver", wsSend: (raw: string) => { messages.push(JSON.parse(raw)); } };
+    const first = await runPrompt(job, deps);
+    expect(first.status).toBe("failed");
+    expect(messages.some(m => m.type === "node_error" && /handoff/i.test(m.data.message))).toBe(true);
+    const saved = fs.readFileSync(path.join(f.state, fs.readdirSync(f.state)[0]), "utf8");
+    messages.length = 0;
+    const correction = await runPrompt({ ...job, nativeSessionRequired: true, task: "## input:correction\nSubmit the missing handoff" }, deps);
+    const calls = f.requests();
+    expect(calls.filter(c => c.method === "thread/start")).toHaveLength(1);
+    expect(calls.filter(c => c.method === "thread/resume")).toHaveLength(1);
+    expect(calls.find(c => c.method === "thread/resume").params.threadId).toBe("native-thread");
+    expect(calls.filter(c => c.method === "turn/start")).toHaveLength(2);
+    expect(calls.find(c => c.method === "thread/start").params.dynamicTools.map((t: {name: string}) => t.name).sort()).toEqual(["handoff", "report_activity"]);
+    expect(fs.readFileSync(path.join(f.state, fs.readdirSync(f.state)[0]), "utf8")).toBe(saved);
+    if (toolOnResume === "handoff") {
+      expect(correction.status).toBe("completed");
+      expect(messages.filter(m => m.type === "response")).toHaveLength(1);
+      expect(calls).toContainEqual(expect.objectContaining({ id: 500, result: expect.objectContaining({ success: true }) }));
+    } else {
+      expect(correction).toMatchObject({ status: "failed", reason: expect.stringContaining("outside the HomeRail allowlist") });
+      expect(messages.some(m => m.type === "response")).toBe(false);
+      expect(calls).toContainEqual(expect.objectContaining({ id: 500, error: expect.objectContaining({ message: expect.stringContaining("allowlist") }) }));
+    }
+  });
+
+  it("rejects turn tools outside the declared schema and changed session declarations before resume", async () => {
+    const f = fixture();
+    const handoff: DagToolDefinition = { name: "handoff", description: "Return", input_schema: { type: "object" }, handler: vi.fn() };
+    expect(await collect({ ...f.context, nativeSessionTools: [] }, [handoff])).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("stable session declarations") }));
+    expect(f.requests().some(c => c.method === "thread/start")).toBe(false);
+    await collect({ ...f.context, nativeSessionTools: [handoff] }, [handoff]);
+    const changed = { ...handoff, input_schema: { type: "object", properties: { changed: { type: "string" } } } };
+    expect(await collect({ ...f.context, nativeSessionTools: [handoff] }, [changed])).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("stable session declarations") }));
+    expect(await collect({ ...f.context, nativeSessionTools: [changed] }, [changed])).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("binding changed") }));
+    expect(f.requests().some(c => c.method === "thread/resume")).toBe(false);
+    expect(f.requests().filter(c => c.method === "turn/start")).toHaveLength(1);
   });
 
   it.each(["apiKey", "amazonBedrock"])("refuses %s authentication before thread creation", async account => {

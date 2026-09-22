@@ -388,6 +388,9 @@ export class ChangeOrchestrator {
     const inputScope = request.inputScope?.trim();
     let inputArtifacts: ReturnType<typeof resolveDagRunInputBindings> | undefined;
     if (requestedInputArtifacts.length > 0) {
+      if (Object.values(dagWithRuntime.meta.agents ?? {}).some(agent => agent.native_subscription !== undefined)) {
+        throw new Error("native_subscription does not support run input artifact projections; remove input_artifacts before creating the run");
+      }
       if (!inputScope) throw new Error("input_scope is required when input_artifacts are bound");
       inputArtifacts = resolveDagRunInputBindings(inputScope, requestedInputArtifacts);
     }
