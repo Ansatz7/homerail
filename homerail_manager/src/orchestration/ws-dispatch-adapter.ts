@@ -4,7 +4,7 @@ import {
   NATIVE_CODEX_SUBSCRIPTION_CAPABILITY,
   NATIVE_CODEX_SUBSCRIPTION_EXECUTION_MODE,
 } from "homerail-protocol";
-import { assertNativeSubscriptionPolicy, resolveNativeSubscriptionAgent } from "../runtime/native-subscription-runtime.js";
+import { assertNativeSubscriptionPolicy, assertNativeSubscriptionWorkspace, resolveNativeSubscriptionAgent } from "../runtime/native-subscription-runtime.js";
 import type {
   DAGDispatcher,
   DispatchEnvelope,
@@ -136,6 +136,7 @@ function isNativeSubscription(envelope: DispatchEnvelope): boolean {
 }
 
 function assertNativeSubscriptionEnvelope(envelope: DispatchEnvelope): void {
+  assertNativeSubscriptionWorkspace(envelope.workspace);
   const { llm, ...selection } = envelope.agentConfig;
   const resolved = resolveNativeSubscriptionAgent(selection);
   if (envelope.agentConfig.agent_type !== "codex_appserver" || !llm
@@ -732,7 +733,8 @@ export class WsDispatchAdapter implements DAGDispatcher {
       // environment settings crossing the trusted native Node boundary.
       provisionerOpts.executionMode = NATIVE_CODEX_SUBSCRIPTION_EXECUTION_MODE;
       provisionerOpts.image = undefined;
-      provisionerOpts.workspace = undefined;
+      // Preserve the validated workflow mode, never ambient provisioning paths.
+      provisionerOpts.workspace = envelope.workspace;
       provisionerOpts.workspaceWritableSubpath = undefined;
       provisionerOpts.workspaceInputs = undefined;
       provisionerOpts.workspaceGitMetadataReadOnly = undefined;

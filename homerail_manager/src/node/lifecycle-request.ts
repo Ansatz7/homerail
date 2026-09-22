@@ -110,6 +110,7 @@ export function sendWorkerCreateRequest(
     return sendLifecycleRequest(nodeId, "worker", "create", {
       execution_mode: options.executionMode,
       workspace_id: workspaceId,
+      workspace: options.workspace,
       workspace_read_only: options.workspaceReadOnly === true,
       workspace_access: options.workspaceAccess,
       env: options.env,

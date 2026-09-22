@@ -24,6 +24,15 @@ export function resolveNativeSubscriptionAgent(agent: DAGAgentConfig): DAGAgentC
   };
 }
 
+export function assertNativeSubscriptionWorkspace(workspace: unknown): void {
+  if (workspace === undefined) return;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)
+    || Object.keys(workspace).some(key => key !== "mode")
+    || !["isolated", "shared"].includes(String((workspace as Record<string, unknown>).mode))) {
+    throw new Error("native_subscription workspace accepts only isolated/shared mode; prepare files on the trusted Node before execution");
+  }
+}
+
 export function assertNativeSubscriptionPolicy(runtime: Record<string, unknown>): void {
   const access = runtime.workspace_access as { writable_paths?: unknown } | undefined;
   if (runtime.codex_sandbox !== "read-only" || !access

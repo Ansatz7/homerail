@@ -53,6 +53,10 @@ mandatory; credential injection, advisors, dispatch-scoped sessions, container
 images and groups are unsupported. This initial Manager path also rejects run
 input artifact projections at run creation, including mixed native/API workflows.
 The dispatch guard also rejects bindings on previously persisted runs. An
+explicit workspace mode of `isolated` or `shared` is forwarded unchanged to the
+Node. Other workspace configuration, including `git_clone`, `local_copy` and
+source paths, is rejected by public workflow validation and the dispatch guard
+rather than discarded. An
 isolated verification harness can prepare files
 in the Node's run workspace before execution.
 

@@ -252,10 +252,14 @@ describe("explicit native Codex subscription DAGs", () => {
       });
     }
     expect(adapter.dispatch({ ...envelope, codexSandbox: "workspace-write" })).toMatchObject({ status: "failed", retryable: false });
+    for (const workspace of [{ mode: "git_clone", repo_url: "https://example.com/repo.git" }, { mode: "shared", source_path: "/host/source" }]) {
+      expect(adapter.dispatch({ ...envelope, workspace })).toMatchObject({ status: "failed", retryable: false,
+        reason: expect.stringContaining("workspace accepts only isolated/shared mode") });
+    }
     expect(nativeSend).not.toHaveBeenCalled();
   });
 
-  it("uses the existing native provisioning, registration, lease and cancel cleanup lifecycle", async () => {
+  it.each([undefined, "isolated", "shared"])("preserves workspace mode %s through native provisioning, registration and cancel cleanup", async mode => {
     const requests: Array<{ request_id: string; operation: string; spec: Record<string, any> }> = [];
     const workerSend = vi.fn();
     let workerId = "";
@@ -269,10 +273,12 @@ describe("explicit native Codex subscription DAGs", () => {
     const foreignSend = node("foreign-native", [NATIVE_CODEX_SUBSCRIPTION_CAPABILITY]);
     getNode("foreign-native")!.project_id = "other-project";
     node("native", [NATIVE_CODEX_SUBSCRIPTION_CAPABILITY], nativeSend);
-    upsertDagWorkflowFromYaml({ yaml_text: JSON.stringify(workflow()) });
+    const source = workflow();
+    if (mode) Object.assign(source.spec, { workspace: { mode } });
+    upsertDagWorkflowFromYaml({ yaml_text: JSON.stringify(source) });
     const adapter = new WsDispatchAdapter({
       managerBaseUrl: "http://127.0.0.1:1234", managerWorkerWsBaseUrl: "ws://docker-callback.invalid:1234",
-      provisioner: { image: "must-not-be-used", env: { OPENAI_API_KEY: "must-not-be-forwarded" }, runtimeStatusFn: async () => {
+      provisioner: { image: "must-not-be-used", workspace: { mode: "local_copy", source_path: "/ambient/must-not-be-used" }, env: { OPENAI_API_KEY: "must-not-be-forwarded" }, runtimeStatusFn: async () => {
         registerWorker({ worker_id: workerId, project_id: "p1", status: "idle",
           capabilities: [DAG_TRANSPORT_FENCE_CAPABILITY, NATIVE_CODEX_SUBSCRIPTION_CAPABILITY],
           socket: { readyState: WebSocket.OPEN, send: workerSend } as unknown as WebSocket,
@@ -286,6 +292,7 @@ describe("explicit native Codex subscription DAGs", () => {
     expect(requests.slice(0, 2).map((request) => request.operation)).toEqual(["create", "start"]);
     expect(requests[0].spec).toEqual({
       execution_mode: "native_codex_subscription", workspace_id: "native-lifecycle", workspace_read_only: true,
+      workspace: { mode: mode ?? "isolated" },
       workspace_access: { writable_paths: [], readonly_paths: [] }, env: {
         AGENT_BACKEND: "codex_appserver", HOMERAIL_WORKER_ID: workerId,
         MANAGER_WORKER_WS_URL: `ws://127.0.0.1:1234/ws/projects/p1/workers/${workerId}`,
