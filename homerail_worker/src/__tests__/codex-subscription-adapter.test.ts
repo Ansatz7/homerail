@@ -28,7 +28,7 @@ vi.mock("node:child_process", async () => {
   return { ...actual, spawn };
 });
 
-function fixture(options: { account?: string; model?: string; status?: string; slowAck?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
+function fixture(options: { account?: string; model?: string; status?: string; slowAck?: boolean; silent?: boolean; resumeError?: boolean; toolCall?: boolean; permissionMismatch?: boolean; networkAccess?: boolean } = {}) {
   // Windows runner temp roots arrive as 8.3 short names that the adapter resolves.
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-codex-adapter-test-")));
   roots.push(root);
@@ -66,12 +66,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
      reply(req.id,{turn:{id:'native-turn'}});
      if(options.toolCall){
        process.stdout.write(JSON.stringify({id:500,method:'item/tool/call',params:{threadId:'native-thread',turnId:'native-turn',callId:'native-handoff',tool:'handoff',arguments:{port:'done',content:'complete'}}})+'\\n');
-     }else if(!options.slowAck){
+     }else if(!options.slowAck && !options.silent){
        notify('item/completed',{threadId:'native-thread',turnId:'native-turn',item:{type:'agentMessage',phase:'final_answer',text:'verified result'}});
        notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:options.status||'completed'}});
      }
    },options.slowAck?150:0);break;
- case 'turn/interrupt':reply(req.id,{});notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:'interrupted'}});break;
+ case 'turn/interrupt':reply(req.id,{});if(!options.silent)notify('turn/completed',{threadId:'native-thread',turn:{id:'native-turn',status:'interrupted'}});break;
  case 'thread/unsubscribe':reply(req.id,{});break;
  }
 });
@@ -187,6 +187,20 @@ describe("native Codex subscription transport", () => {
     const events = await result;
     expect(f.requests()).toContainEqual(expect.objectContaining({ method: "turn/interrupt", params: { threadId: "native-thread", turnId: "native-turn" } }));
     expect(events.some(e => e.type === "error")).toBe(true);
+    expect(fs.readdirSync(f.state)).toHaveLength(1);
+  });
+
+  it("rejects native cancellation without a terminal acknowledgement", async () => {
+    const f = fixture({ silent: true });
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    for await (const event of new CodexAppServerAdapter(undefined, 20).run("Read only", [], { ...f.context, abortSignal: controller.signal })) {
+      events.push(event);
+      if (event.type === "debug" && event.message === "turn_started") controller.abort();
+    }
+    expect(f.requests()).toContainEqual(expect.objectContaining({ method: "turn/interrupt", params: { threadId: "native-thread", turnId: "native-turn" } }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("cancelled before terminal acknowledgement") }));
+    expect(events.some(event => event.type === "turn_complete")).toBe(false);
     expect(fs.readdirSync(f.state)).toHaveLength(1);
   });
 

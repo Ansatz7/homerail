@@ -574,6 +574,7 @@ export class CodexAppServerAdapter implements AgentClient {
       // Execute turns with iteration guard
       let iteration = 0;
       let turnComplete = false;
+      let cancelledQuietly = false;
 
       while (iteration < maxIterations && !turnComplete && !context.abortSignal?.aborted) {
         iteration++;
@@ -609,7 +610,18 @@ export class CodexAppServerAdapter implements AgentClient {
           } catch (err) {
             if (err instanceof NotificationWaitTimeoutError) {
               if (context.abortSignal?.aborted) {
-                throw new Error("Codex turn cancelled before terminal acknowledgement");
+                if (this.nativeRuntime) {
+                  // Native subscription runs must never read a missing terminal
+                  // acknowledgement as success.
+                  throw new Error("Codex turn cancelled before terminal acknowledgement");
+                }
+                // Ordinary user-requested cancellation is an expected outcome, not an
+                // adapter failure: the abort handler already sent turn/interrupt, so
+                // stop draining notifications quietly and let cleanup finish the run.
+                // Recording the quiet stop also stops the outer iteration guard from
+                // rewriting that cancellation as an iteration-limit error.
+                cancelledQuietly = true;
+                break;
               }
               // A silent model may still be reasoning or waiting on its
               // provider. Emit a content-free heartbeat so the worker keeps
@@ -704,7 +716,7 @@ export class CodexAppServerAdapter implements AgentClient {
       }
 
       if (context.abortSignal?.aborted && this.nativeRuntime) throw new Error("Native Codex turn cancelled");
-      if (iteration >= maxIterations && !turnComplete) {
+      if (iteration >= maxIterations && !turnComplete && !cancelledQuietly) {
         yield { type: "error", message: `Exceeded max iterations (${maxIterations})` };
       }
 
